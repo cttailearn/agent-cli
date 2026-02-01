@@ -1,0 +1,12 @@
+.DS_Store
+agent/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.env.*
+db/*.db
+out/*
+dist/
+*.log
