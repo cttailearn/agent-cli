@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 import re
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -174,9 +176,52 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
     chunks: list[str] = []
     tool_chunks: list[str] = []
     has_tool_output = False
-    print("【Assistant】", flush=True)
-    tool_header_printed = False
+    sys.stdout.write("【Assistant】\n")
+    sys.stdout.flush()
+    channel: str = "assistant"
+    last_output_newline = True
+    assistant_buf = ""
+    last_flush_t = time.monotonic()
     tool_stream_buf = ""
+
+    def _write_out(s: str, flush: bool = False) -> None:
+        nonlocal last_output_newline
+        if not s:
+            return
+        sys.stdout.write(s)
+        last_output_newline = s.endswith("\n")
+        if flush:
+            sys.stdout.flush()
+
+    def _flush_assistant(force: bool = False) -> None:
+        nonlocal assistant_buf, last_flush_t
+        if not assistant_buf:
+            return
+        now = time.monotonic()
+        if force or "\n" in assistant_buf or len(assistant_buf) >= 256 or (now - last_flush_t) >= 0.03:
+            _write_out(assistant_buf, flush=True)
+            assistant_buf = ""
+            last_flush_t = now
+
+    def _switch_to_tools() -> None:
+        nonlocal channel
+        if channel == "tools":
+            return
+        _flush_assistant(force=True)
+        if not last_output_newline:
+            _write_out("\n", flush=True)
+        _write_out("【Tools】\n", flush=True)
+        channel = "tools"
+
+    def _switch_to_assistant() -> None:
+        nonlocal channel
+        if channel == "assistant":
+            return
+        if not last_output_newline:
+            _write_out("\n", flush=True)
+        _write_out("【Assistant】\n", flush=True)
+        channel = "assistant"
+
     for event in agent.stream({"messages": messages}, stream_mode="messages"):
         if isinstance(event, tuple) and event:
             msg = event[0]
@@ -185,7 +230,9 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
         if isinstance(msg, AIMessageChunk):
             text = _extract_text(msg)
             if text:
-                print(text, end="", flush=True)
+                _switch_to_assistant()
+                assistant_buf += text
+                _flush_assistant(force=False)
                 chunks.append(text)
         elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
             text = _extract_text(msg)
@@ -193,9 +240,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
                 tool_chunks.append(text)
                 has_tool_output = True
                 if state.show_tool_output:
-                    if not tool_header_printed:
-                        print("【Tools】", flush=True)
-                        tool_header_printed = True
+                    _switch_to_tools()
                     tool_stream_buf += text
                     while "\n" in tool_stream_buf:
                         line, tool_stream_buf = tool_stream_buf.split("\n", 1)
@@ -206,8 +251,10 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
                             or s.startswith("Edited: ")
                             or s.startswith("Deleted: ")
                         ):
-                            print(s, flush=True)
-    print()
+                            _write_out(f"{s}\n", flush=True)
+    _flush_assistant(force=True)
+    if not last_output_newline:
+        _write_out("\n", flush=True)
     reply = "".join(chunks)
     actions = actions_since(snapshot)
 

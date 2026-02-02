@@ -6,7 +6,7 @@ from pathlib import Path
 
 import dotenv
 
-from agent_runtime import build_agent
+from agents.runtime import build_agent
 from terminal_display import CliState, handle_local_command, stream_assistant_reply
 
 

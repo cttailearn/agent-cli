@@ -1039,15 +1039,55 @@ Bash = tool("Bash")(_bash)
 
 
 def _run_coroutine(coro):
+    def _run_in_new_loop():
+        loop = asyncio.new_event_loop()
+        try:
+            asyncio.set_event_loop(loop)
+            result = loop.run_until_complete(coro)
+            pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+            if pending:
+                for t in pending:
+                    t.cancel()
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            except Exception:
+                pass
+            try:
+                loop.run_until_complete(loop.shutdown_default_executor())
+            except Exception:
+                pass
+            return result
+        finally:
+            try:
+                asyncio.set_event_loop(None)
+            except Exception:
+                pass
+            loop.close()
+
     try:
-        asyncio.get_running_loop()
+        running_loop = asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(coro)
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(coro)
-    finally:
-        loop.close()
+        return _run_in_new_loop()
+
+    if running_loop.is_running():
+        result_box: dict[str, object] = {}
+
+        def _thread_runner():
+            try:
+                result_box["value"] = _run_in_new_loop()
+            except BaseException as e:
+                result_box["error"] = e
+
+        t = threading.Thread(target=_thread_runner, daemon=True)
+        t.start()
+        t.join()
+        err = result_box.get("error")
+        if isinstance(err, BaseException):
+            raise err
+        return result_box.get("value")
+
+    return _run_in_new_loop()
 
 
 def _ensure_sync_invoke_tools(tools: list[object]) -> list[object]:
@@ -1162,21 +1202,27 @@ def load_mcp_tools_from_config(config_path: str | Path | None = None) -> list[ob
         )
         return []
 
-    try:
-        client = MultiServerMCPClient(connections, tool_name_prefix=tool_name_prefix)
-        tools = _run_coroutine(client.get_tools())
-    except Exception as e:
-        _log_action(
-            {
-                "kind": "mcp_get_tools",
-                "ok": False,
-                "path": p.as_posix(),
-                "servers": list(connections.keys()),
-                "error": str(e),
-                "ts": time.time(),
-            }
-        )
-        return []
+    loaded_tools: list[object] = []
+    failed: dict[str, str] = {}
+
+    for name, cfg in connections.items():
+        try:
+            client = MultiServerMCPClient({name: cfg}, tool_name_prefix=tool_name_prefix)
+            server_tools = _run_coroutine(client.get_tools())
+            if isinstance(server_tools, list):
+                loaded_tools.extend(server_tools)
+        except Exception as e:
+            failed[name] = str(e)
+            _log_action(
+                {
+                    "kind": "mcp_get_tools_server",
+                    "ok": False,
+                    "path": p.as_posix(),
+                    "server": name,
+                    "error": str(e),
+                    "ts": time.time(),
+                }
+            )
 
     _log_action(
         {
@@ -1184,8 +1230,9 @@ def load_mcp_tools_from_config(config_path: str | Path | None = None) -> list[ob
             "ok": True,
             "path": p.as_posix(),
             "servers": list(connections.keys()),
-            "tool_count": len(tools) if isinstance(tools, list) else -1,
+            "failed_servers": list(failed.keys()),
+            "tool_count": len(loaded_tools),
             "ts": time.time(),
         }
     )
-    return _ensure_sync_invoke_tools(list(tools)) if isinstance(tools, list) else []
+    return _ensure_sync_invoke_tools(list(loaded_tools))
