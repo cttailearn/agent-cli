@@ -6,7 +6,11 @@ from pathlib import Path
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
-from skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
+from skills.skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
+
+from memory import load_core_prompt
+
+from agents.tools import memory_core_read, memory_kg_recall, memory_kg_stats, memory_user_read, memory_user_write
 
 from .runtime import _format_tools, _init_model, _run_agent_to_text, _summarize_tool_output_for_terminal
 
@@ -116,6 +120,27 @@ def build_observer_agent(
         return answer
 
     @tool
+    def append_core_memory(kind: str, content: str) -> str:
+        """Delegate to executor to append content into core memory markdown."""
+        k = (kind or "").strip()
+        text = (content or "").strip()
+        if not k:
+            return "Missing kind."
+        if not text:
+            return "Empty content."
+        return delegate_to_executor(
+            "\n".join(
+                [
+                    "请将以下内容写入项目 core 记忆 Markdown（追加写入）。",
+                    "要求：只调用一次 memory_core_append(kind, content)，并返回调用结果。",
+                    f"kind={k}",
+                    "content:",
+                    text,
+                ]
+            )
+        )
+
+    @tool
     def start_supervision(task: str) -> str:
         """Start supervision for a complex task and return task_id."""
         nonlocal last_supervision_task_id
@@ -187,6 +212,18 @@ def build_observer_agent(
             tid = last_supervision_task_id
         if not tid:
             return ""
+        finalize = None
+        for t in supervisor_tools:
+            if getattr(t, "name", "") == "finalize_task":
+                finalize = t
+                break
+        if finalize is not None and hasattr(finalize, "invoke"):
+            try:
+                result = finalize.invoke({"task_id": tid, "keep_record": False})
+                last_supervision_task_id = ""
+                return str(result or "")
+            except Exception:
+                pass
         answer, tool_output = _run_agent_to_text(
             supervisor_agent,
             [
@@ -217,9 +254,15 @@ def build_observer_agent(
             remember,
             recall,
             forget,
+            memory_core_read,
+            memory_user_read,
+            memory_user_write,
+            memory_kg_recall,
+            memory_kg_stats,
             is_complex_task,
             delegate_to_executor,
             delegate_to_supervisor,
+            append_core_memory,
             start_supervision,
             supervised_check,
             finish_supervision,
@@ -235,11 +278,16 @@ def build_observer_agent(
             "复杂任务时必须启动监督者：先调用 start_supervision(task) 获取 task_id，再在每次执行后调用 supervised_check(task_id, executor_result)。",
             "只有当监督者判断任务完成后，才调用 finish_supervision(task_id) 清理监督者的任务记忆。",
             "你可以使用 remember/recall/forget 管理你自己的会话记忆。",
+            "灵魂/特性/身份：始终以 memory_core_read 读取的 core 记忆为准，并在关键决策时对齐。",
+            "当用户要求设定/修改你的身体、性格、表达风格、身份边界、原则时，你必须把稳定信息写入 core 记忆：用 append_core_memory(kind, content) 委派执行者追加写入（identity/traits/soul）。",
+            "只有当 append_core_memory 返回 OK 时，你才可以对用户说“已保存/已写入”。",
+            "需要回忆长期事实、偏好、人物/项目关系时，先调用 memory_kg_recall(query) 检索知识图谱。",
             "你只能使用查看与委派类工具，不得直接调用任何项目读写或命令执行类工具。",
             "严禁虚构已执行的动作：除非执行者确实通过工具产生了可验证的结果，否则不要声称“已创建/已运行/已完成”。",
             f"执行者通过 write_file 工具生成的任何文件都必须写入该目录：{output_dir.as_posix()}",
             f"执行者可以通过 read_file/list_dir/write_project_file/delete_path 工具读取与修改项目目录：{project_root.as_posix()}",
             f"执行者可以使用 Bash（或 run_cli）工具在工作目录内执行命令行命令：{work_dir.as_posix()}（受超时限制）。",
+            load_core_prompt(project_root),
         ]
     )
 

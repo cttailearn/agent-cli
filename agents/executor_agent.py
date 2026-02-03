@@ -5,8 +5,8 @@ from pathlib import Path
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
-from skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
-from tools import (
+from skills.skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
+from agents.tools import (
     Bash,
     Read,
     Write,
@@ -15,11 +15,15 @@ from tools import (
     glob_paths,
     grep,
     list_dir,
+    memory_core_append,
+    memory_user_write,
     read_file,
     run_cli,
     write_file,
     write_project_file,
 )
+
+from memory import load_core_prompt
 
 from .runtime import _format_tools, _init_model
 
@@ -54,9 +58,12 @@ def build_executor_agent(
             "除非确有必要，否则不要加载技能全文。",
             "严禁虚构已执行的动作：只有在实际调用工具成功后，才可以声称“已创建/已运行/已完成”。",
             "如果工具不可用或执行失败，必须明确说明未完成，并给出可执行的替代方案或下一步。",
+            "灵魂/特性/身份：始终以项目 memory/ 下的 core 记忆为准；需要更新时可使用 memory_core_append。",
+            "任务需要回忆历史事实时，优先让观察者使用 memory_kg_recall 检索知识图谱再决策。",
             f"你通过 write_file 工具生成的任何文件都必须写入该目录：{output_dir.as_posix()}",
             f"你可以通过 read_file/list_dir/write_project_file/delete_path 工具读取与修改项目目录：{project_root.as_posix()}",
             f"你可以使用 Bash（或 run_cli）工具在工作目录内执行命令行命令：{work_dir.as_posix()}（受超时限制）。",
+            load_core_prompt(project_root),
         ]
     )
 
@@ -82,6 +89,8 @@ def executor_tools(*, mcp_tools: list[object], skill_middleware: SkillMiddleware
         write_project_file,
         delete_path,
         run_cli,
+        memory_core_append,
+        memory_user_write,
         *mcp_tools,
         *skill_middleware.tools,
     ]

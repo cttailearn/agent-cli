@@ -9,6 +9,8 @@ from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 from langchain_core.messages import SystemMessage
 from langchain_core.tools import tool
 
+from . import skills_state
+
 
 BASE_SYSTEM_PROMPT = "You are a single agent that can use skills via progressive disclosure."
 
@@ -98,6 +100,10 @@ def discover_skills_from_dirs(skills_dirs: Sequence[Path]) -> list[SkillManifest
     return unique
 
 
+def discover_enabled_skills_from_dirs(skills_dirs: Sequence[Path]) -> list[SkillManifest]:
+    return [s for s in discover_skills_from_dirs(skills_dirs) if not skills_state.is_disabled(s.name)]
+
+
 def build_skill_catalog_text(manifests: list[SkillManifest]) -> str:
     if not manifests:
         return "No skills found."
@@ -137,7 +143,7 @@ class _SkillIndex:
         if not force and self._fingerprint == fingerprint:
             return False
 
-        manifests = discover_skills_from_dirs(self.skills_dirs)
+        manifests = discover_enabled_skills_from_dirs(self.skills_dirs)
         self._manifests = manifests
         self._skill_by_name = {s.name: s for s in manifests}
         self._catalog_text = build_skill_catalog_text(manifests)
@@ -155,6 +161,8 @@ class _SkillIndex:
         if manifest is None:
             known = ", ".join(sorted(self._skill_by_name.keys()))
             return f"Unknown skill: {name}. Known skills: {known}"
+
+        skills_state.record_skill_loaded(name)
 
         cached = self._loaded_skill_cache.get(name)
         if cached is not None:
@@ -221,3 +229,4 @@ def create_skill_middleware(skills_dir: Path | Sequence[Path]) -> tuple[str, Ski
         skills_prompt_supplier=index.get_catalog_text,
         tools=[list_skills, load_skill],
     )
+

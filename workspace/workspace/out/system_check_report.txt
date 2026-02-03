@@ -1,0 +1,38 @@
+系统检查报告
+==================
+检查时间：$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+
+1. 当前工作目录 (pwd):
+   D:\tools\agent-cli\workspace
+
+2. 工作区目录 (D:/tools/agent-cli/workspace) 内容概览:
+   - workspace/ (子目录)
+
+   详细内容:
+   workspace 子目录包含:
+   - memory/ (记忆目录)
+   - out/ (输出目录，当前为空)
+
+3. 输出目录 (D:/tools/agent-cli/workspace/workspace/out) 内容:
+   (空目录)
+
+4. 系统信息:
+   - 操作系统版本: Microsoft Windows NT 10.0.26200.0
+   - 内存:
+     * 总物理内存: 31.73 GB
+     * 可用内存: 5403 MB (约 5.28 GB)
+   - 磁盘空间:
+     * C: 盘: 总容量 209.7 GB, 已用 182.2 GB, 剩余 27.5 GB
+     * D: 盘: 总容量 813.0 GB, 已用 381.6 GB, 剩余 431.5 GB
+
+5. 当前用户和进程信息:
+   - 当前用户: cttai\cttai
+   - 当前 PowerShell 进程 ID: 38340
+   - 系统总进程数: 459
+
+6. 记忆文件存在性:
+   - soul.md, traits.md, identity.md, user.md 存在于 workspace/memory/
+   - 知识图谱目录: workspace/memory/kg/
+   - 聊天记录目录: workspace/memory/chats/
+
+检查完成。

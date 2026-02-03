@@ -1236,3 +1236,120 @@ def load_mcp_tools_from_config(config_path: str | Path | None = None) -> list[ob
         }
     )
     return _ensure_sync_invoke_tools(list(loaded_tools))
+
+
+def _memory_project_root() -> Path:
+    try:
+        return _project_root().expanduser().resolve()
+    except OSError:
+        return Path(__file__).resolve().parent
+
+
+@tool
+def memory_core_read(kind: str) -> str:
+    """Read long-term core memory markdown: soul / traits / identity / user."""
+    try:
+        from memory.paths import core_file_by_kind
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = core_file_by_kind(_memory_project_root(), kind)
+    if p is None:
+        return "Unknown kind. Use soul|traits|identity|user."
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"Read failed: {e}"
+
+
+@tool
+def memory_core_append(kind: str, content: str) -> str:
+    """Append content to core memory markdown: soul / traits / identity / user."""
+    try:
+        from memory.paths import core_file_by_kind
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = core_file_by_kind(_memory_project_root(), kind)
+    if p is None:
+        return "Unknown kind. Use soul|traits|identity|user."
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = (content or "").strip()
+    if not text:
+        return "Empty content."
+    try:
+        existing = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        sep = "\n\n" if existing and not existing.endswith("\n") else "\n"
+        p.write_text(f"{existing}{sep}{text}\n", encoding="utf-8", errors="replace")
+        _log_action({"kind": "memory_core_append", "ok": True, "path": p.as_posix(), "size": len(text), "ts": time.time()})
+        return "OK"
+    except OSError as e:
+        _log_action({"kind": "memory_core_append", "ok": False, "path": p.as_posix(), "error": str(e), "ts": time.time()})
+        return f"Write failed: {e}"
+
+
+@tool
+def memory_kg_recall(query: str, limit: int = 12) -> str:
+    """Search the knowledge graph built from chat logs."""
+    try:
+        from memory.paths import graph_path
+        from memory.query import search_graph
+        from memory.storage import KnowledgeGraphStore
+    except Exception as e:
+        return f"Import failed: {e}"
+    q = (query or "").strip()
+    if not q:
+        return ""
+    if limit <= 0:
+        limit = 12
+    limit = max(1, min(50, int(limit)))
+    store = KnowledgeGraphStore(graph_path=graph_path(_memory_project_root()))
+    return search_graph(store, q, limit=limit)
+
+
+@tool
+def memory_kg_stats() -> str:
+    """Show knowledge graph size info."""
+    try:
+        from memory.paths import graph_path
+        from memory.query import graph_stats
+        from memory.storage import KnowledgeGraphStore
+    except Exception as e:
+        return f"Import failed: {e}"
+    store = KnowledgeGraphStore(graph_path=graph_path(_memory_project_root()))
+    return graph_stats(store)
+
+
+@tool
+def memory_user_read() -> str:
+    """Read user memory markdown."""
+    try:
+        from memory.paths import user_path
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = user_path(_memory_project_root())
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"Read failed: {e}"
+
+
+@tool
+def memory_user_write(content: str) -> str:
+    """Overwrite user memory markdown."""
+    try:
+        from memory.paths import user_path
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = user_path(_memory_project_root())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = (content or "").strip()
+    try:
+        p.write_text(f"{text}\n" if text else "", encoding="utf-8", errors="replace")
+        _log_action({"kind": "memory_user_write", "ok": True, "path": p.as_posix(), "size": len(text), "ts": time.time()})
+        return "OK"
+    except OSError as e:
+        _log_action({"kind": "memory_user_write", "ok": False, "path": p.as_posix(), "error": str(e), "ts": time.time()})
+        return f"Write failed: {e}"

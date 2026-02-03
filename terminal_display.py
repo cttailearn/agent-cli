@@ -15,7 +15,8 @@ from langchain_core.messages import (
     ToolMessageChunk,
 )
 
-from tools import action_log_snapshot, actions_since, delete_path, list_dir, read_file, run_cli
+from agents.runtime import capture_token_usage_from_message, estimate_token_usage, get_token_usage, reset_token_usage
+from agents.tools import action_log_snapshot, actions_since, delete_path, list_dir, read_file, run_cli
 
 
 _COMPLETION_CLAIM_RE = re.compile(
@@ -35,6 +36,8 @@ class CliState:
     last_actions: list[dict[str, object]] = field(default_factory=list)
     last_tool_output: str = ""
     last_tool_output_truncated: bool = False
+    last_token_usage: dict[str, int] | None = None
+    last_token_usage_is_estimate: bool = False
 
 
 def _format_actions(actions: list[dict[str, object]]) -> str:
@@ -144,8 +147,8 @@ def _print_last(state: CliState, kind: str) -> None:
             return
         summary = _summarize_actions(state.last_actions)
         if summary:
-            print(f"【Summary】{summary}")
-        _print_block("【Actions】", _format_actions(state.last_actions))
+            print(summary)
+        _print_block("", _format_actions(state.last_actions))
         return
 
     if kind in {"tools", "tool"}:
@@ -154,18 +157,18 @@ def _print_last(state: CliState, kind: str) -> None:
             return
         summarized = _summarize_tool_output_for_terminal(state.last_tool_output)
         if not summarized:
-            print("【Tools】（无可展示的摘要）")
+            print("（无可展示的摘要）")
             return
-        _print_block("【Tools】", summarized)
+        _print_block("", summarized)
         if state.last_tool_output_truncated:
-            print("【Tools】（已截断存储）")
+            print("（已截断存储）")
         return
 
     if kind == "skills":
         if not state.skill_catalog_text:
             print("暂无技能目录。")
             return
-        _print_block(f"【Skills】（共 {state.skill_count} 个）", state.skill_catalog_text)
+        _print_block(f"技能目录（共 {state.skill_count} 个）", state.skill_catalog_text)
         return
 
     print("用法：/last [actions|tools|skills|all]")
@@ -173,16 +176,16 @@ def _print_last(state: CliState, kind: str) -> None:
 
 def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliState) -> str:
     snapshot = action_log_snapshot()
+    reset_token_usage()
     chunks: list[str] = []
     tool_chunks: list[str] = []
     has_tool_output = False
-    sys.stdout.write("【Assistant】\n")
-    sys.stdout.flush()
     channel: str = "assistant"
     last_output_newline = True
     assistant_buf = ""
     last_flush_t = time.monotonic()
     tool_stream_buf = ""
+    last_action_index = 0
 
     def _write_out(s: str, flush: bool = False) -> None:
         nonlocal last_output_newline
@@ -210,7 +213,6 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
         _flush_assistant(force=True)
         if not last_output_newline:
             _write_out("\n", flush=True)
-        _write_out("【Tools】\n", flush=True)
         channel = "tools"
 
     def _switch_to_assistant() -> None:
@@ -219,43 +221,98 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
             return
         if not last_output_newline:
             _write_out("\n", flush=True)
-        _write_out("【Assistant】\n", flush=True)
         channel = "assistant"
 
-    for event in agent.stream({"messages": messages}, stream_mode="messages"):
-        if isinstance(event, tuple) and event:
-            msg = event[0]
+    def _drain_actions() -> None:
+        nonlocal last_action_index
+        actions = actions_since(snapshot)
+        if len(actions) <= last_action_index:
+            return
+        delta = actions[last_action_index:]
+        last_action_index = len(actions)
+        if not delta:
+            return
+        _switch_to_tools()
+        if state.show_action_summary:
+            summary = _summarize_actions(delta)
+            if summary:
+                _write_out(f"{summary}\n", flush=True)
+        _write_out(f"{_format_actions(delta)}\n", flush=True)
+
+    def _recursion_limit() -> int:
+        raw = (os.environ.get("AGENT_RECURSION_LIMIT") or "").strip()
+        if not raw:
+            return 64
+        try:
+            v = int(raw)
+        except ValueError:
+            return 64
+        return max(10, min(500, v))
+
+    try:
+        from langgraph.errors import GraphRecursionError
+    except Exception:
+        GraphRecursionError = None
+
+    try:
+        for event in agent.stream(
+            {"messages": messages},
+            stream_mode="messages",
+            config={"recursion_limit": _recursion_limit()},
+        ):
+            if isinstance(event, tuple) and event:
+                msg = event[0]
+            else:
+                msg = event
+            if isinstance(msg, AIMessageChunk):
+                capture_token_usage_from_message(msg)
+                text = _extract_text(msg)
+                if text:
+                    _switch_to_assistant()
+                    assistant_buf += text
+                    _flush_assistant(force=False)
+                    chunks.append(text)
+                _drain_actions()
+            elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
+                text = _extract_text(msg)
+                if text:
+                    tool_chunks.append(text)
+                    has_tool_output = True
+                    if state.show_tool_output:
+                        _switch_to_tools()
+                        tool_stream_buf += text
+                        while "\n" in tool_stream_buf:
+                            line, tool_stream_buf = tool_stream_buf.split("\n", 1)
+                            s = line.strip()
+                            if (
+                                s.startswith("path: ")
+                                or s.startswith("Wrote file: ")
+                                or s.startswith("Edited: ")
+                                or s.startswith("Deleted: ")
+                            ):
+                                _write_out(f"{s}\n", flush=True)
+                _drain_actions()
+    except Exception as e:
+        _flush_assistant(force=True)
+        if not last_output_newline:
+            _write_out("\n", flush=True)
+        if GraphRecursionError is not None and isinstance(e, GraphRecursionError):
+            msg = f"发生错误：模型工具调用步数达到上限（recursion_limit={_recursion_limit()}），可能陷入循环。\n"
         else:
-            msg = event
-        if isinstance(msg, AIMessageChunk):
-            text = _extract_text(msg)
-            if text:
-                _switch_to_assistant()
-                assistant_buf += text
-                _flush_assistant(force=False)
-                chunks.append(text)
-        elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
-            text = _extract_text(msg)
-            if text:
-                tool_chunks.append(text)
-                has_tool_output = True
-                if state.show_tool_output:
-                    _switch_to_tools()
-                    tool_stream_buf += text
-                    while "\n" in tool_stream_buf:
-                        line, tool_stream_buf = tool_stream_buf.split("\n", 1)
-                        s = line.strip()
-                        if (
-                            s.startswith("path: ")
-                            or s.startswith("Wrote file: ")
-                            or s.startswith("Edited: ")
-                            or s.startswith("Deleted: ")
-                        ):
-                            _write_out(f"{s}\n", flush=True)
+            msg = f"发生错误：{type(e).__name__}: {e}\n"
+        _write_out(msg, flush=True)
+        chunks.append(msg)
+        _drain_actions()
     _flush_assistant(force=True)
     if not last_output_newline:
         _write_out("\n", flush=True)
     reply = "".join(chunks)
+    state.last_token_usage = get_token_usage()
+    state.last_token_usage_is_estimate = False
+    if (state.last_token_usage.get("total_tokens", 0) if state.last_token_usage else 0) <= 0:
+        prompt_text = "\n".join(str(m.get("content") or "") for m in messages)
+        state.last_token_usage = estimate_token_usage(prompt_text, reply)
+        state.last_token_usage_is_estimate = True
     actions = actions_since(snapshot)
 
     state.last_actions = actions
@@ -269,13 +326,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
         state.last_tool_output_truncated = False
 
     if _COMPLETION_CLAIM_RE.search(reply) and not actions:
-        print("【执行校验】本轮未执行任何工具调用，因此未产生可验证的文件/命令执行结果。", flush=True)
-    elif actions and state.show_action_summary:
-        summary = _summarize_actions(actions)
-        if summary:
-            print(f"【Summary】{summary}", flush=True)
-        print("【Actions】", flush=True)
-        print(_format_actions(actions), flush=True)
+        print("本轮未执行任何工具调用，因此未产生可验证的文件/命令执行结果。", flush=True)
 
     return reply
 
@@ -294,7 +345,7 @@ def handle_local_command(
         if not cmd:
             print("用法：!<命令>")
             return "continue"
-        print(f"【CLI】{cmd}")
+        print(f"! {cmd}")
         print(run_cli.invoke({"command": cmd, "stream": False}))
         return "continue"
 
@@ -342,13 +393,13 @@ def handle_local_command(
 
     if cmd in {"ls", "dir"}:
         path = args[0] if args else "."
-        print(f"【ls】{path}")
+        print(f"ls {path}")
         print(list_dir.invoke({"path": path, "recursive": False}))
         return "continue"
 
     if cmd in {"lsr", "tree"}:
         path = args[0] if args else "."
-        print(f"【lsr】{path}")
+        print(f"lsr {path}")
         print(list_dir.invoke({"path": path, "recursive": True}))
         return "continue"
 
@@ -356,14 +407,14 @@ def handle_local_command(
         if not args:
             print("用法：/cat <path>")
             return "continue"
-        print(f"【cat】{args[0]}")
+        print(f"cat {args[0]}")
         return "continue"
 
     if cmd == "rm":
         if not args:
             print("用法：/rm <path>")
             return "continue"
-        print(f"【rm】{args[0]}")
+        print(f"rm {args[0]}")
         print(delete_path.invoke({"path": args[0], "recursive": False}))
         return "continue"
 
@@ -371,7 +422,7 @@ def handle_local_command(
         if not args:
             print("用法：/rmr <path>")
             return "continue"
-        print(f"【rmr】{args[0]}")
+        print(f"rmr {args[0]}")
         print(delete_path.invoke({"path": args[0], "recursive": True}))
         return "continue"
 
@@ -379,7 +430,6 @@ def handle_local_command(
         project_root = Path(os.environ.get("AGENT_PROJECT_DIR", ".")).resolve()
         output_dir = Path(os.environ.get("AGENT_OUTPUT_DIR", ".")).resolve()
         work_dir = Path(os.environ.get("AGENT_WORK_DIR", ".")).resolve()
-        print("【pwd】")
         print(
             "\n".join(
                 [
@@ -415,7 +465,7 @@ def handle_local_command(
             return "continue"
         os.environ["AGENT_WORK_DIR"] = str(resolved)
         os.chdir(resolved)
-        print(f"【cd】{resolved.as_posix()}")
+        print(f"cd {resolved.as_posix()}")
         return "continue"
 
     if cmd in {"clear", "cls"}:
@@ -460,7 +510,7 @@ def handle_local_command(
         if not state.skill_catalog_text:
             print("暂无技能目录。")
             return "continue"
-        _print_block(f"【Skills】（共 {state.skill_count} 个）", state.skill_catalog_text)
+        _print_block(f"技能目录（共 {state.skill_count} 个）", state.skill_catalog_text)
         return "continue"
 
     if cmd in {"last"}:
