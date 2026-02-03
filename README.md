@@ -8,6 +8,49 @@
 
 **项目状态**：代码结构清晰，模块化程度高，处于活跃开发阶段。
 
+## 1.1 环境变量（.env）
+
+项目入口会在启动时自动加载 `.env`（见 [main.py](file:///g:/AI/agent-cli/main.py#L16)）。本项目默认 `.env` 已被 `.gitignore` 忽略，避免误提交密钥（见 [.gitignore](file:///g:/AI/agent-cli/.gitignore#L1-L12)）。
+
+你可以直接使用仓库根目录下生成的 [.env](file:///g:/AI/agent-cli/.env) 作为模板修改；CLI 参数的优先级高于 `.env` 环境变量。
+
+### 1.1.1 基础路径配置（main.py）
+
+- `AGENT_PROJECT_DIR`：项目根目录；为空时默认 `main.py` 所在目录（见 [main.py](file:///g:/AI/agent-cli/main.py#L59-L62)）。
+- `AGENT_OUTPUT_DIR`：输出目录；默认 `out`（见 [main.py](file:///g:/AI/agent-cli/main.py#L37-L40)）。
+- `AGENT_WORK_DIR`：命令执行工作目录；默认等同项目根目录（见 [main.py](file:///g:/AI/agent-cli/main.py#L72-L77)）。
+- `AGENT_SKILLS_DIR`：skills 目录；默认 `skills`（见 [main.py](file:///g:/AI/agent-cli/main.py#L21-L25)）。
+- `AGENT_SKILLS_DIRS`：skills 目录列表（`;` 或 `,` 分隔）；不填则只使用 `AGENT_SKILLS_DIR`（见 [main.py](file:///g:/AI/agent-cli/main.py#L113-L121)）。
+
+### 1.1.2 模型配置
+
+- `LC_MODEL`：模型名称（默认 `deepseek:deepseek-reasoner`，见 [main.py](file:///g:/AI/agent-cli/main.py#L47-L50)）。
+  - `deepseek:*`：走 DeepSeek 初始化（见 [runtime.py](file:///g:/AI/agent-cli/agents/runtime.py#L270-L280)）。
+  - 带 Provider 前缀（例如 `openai:gpt-4o-mini`）：走 LangChain 通用 `init_chat_model`。
+  - 不带 Provider 前缀（例如 `moonshotai/Kimi-K2.5`）：默认按 OpenAI 兼容接口处理（自动回退为 `model_provider="openai"`），只需要配置 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `LC_MODEL` 即可（见 [runtime.py](file:///g:/AI/agent-cli/agents/runtime.py#L270-L283) 与 [model.py](file:///g:/AI/agent-cli/memory/model.py#L20-L31)）。
+- `DEEPSEEK_API_KEY`：DeepSeek API Key（供 `langchain-deepseek` 使用；项目代码不直接读取，但运行 DeepSeek 模型通常需要它）。
+- `OPENAI_API_KEY`：OpenAI API Key（供 OpenAI/兼容 OpenAI 接口使用）。
+- `OPENAI_BASE_URL`：OpenAI 兼容接口的 Base URL（例如 `https://xxx/v1`；使用官方 OpenAI 可不填或设为 `https://api.openai.com/v1`）。
+
+### 1.1.3 MCP 配置
+
+- `AGENT_MCP_CONFIG`：MCP 配置文件路径（相对项目根目录或绝对路径；为空则不加载 MCP 工具，见 [load_mcp_tools_from_config](file:///g:/AI/agent-cli/agents/tools.py#L1128-L1136) 与 [main.py](file:///g:/AI/agent-cli/main.py#L78-L83)）。
+
+### 1.1.4 记忆系统路径（memory/paths.py）
+
+以下配置支持相对路径（相对 `AGENT_PROJECT_DIR`）或绝对路径（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L7-L12)）：
+
+- `AGENT_MEMORY_DIR`：记忆根目录；默认 `memory`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L24-L29)）。
+- `AGENT_MEMORY_CORE_DIR`：core 记忆目录；默认等同 `AGENT_MEMORY_DIR`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L31-L35)）。
+- `AGENT_MEMORY_CHATS_DIR`：聊天记录目录；默认 `{AGENT_MEMORY_DIR}/chats`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L38-L43)）。
+- `AGENT_MEMORY_KG_DIR`：知识图谱目录；默认 `{AGENT_MEMORY_DIR}/kg`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L45-L49)）。
+- `AGENT_MEMORY_GRAPH_PATH`：知识图谱文件路径；默认 `{AGENT_MEMORY_KG_DIR}/graph.json`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L52-L56)）。
+- `AGENT_MEMORY_SOUL_PATH` / `AGENT_MEMORY_TRAITS_PATH` / `AGENT_MEMORY_IDENTITY_PATH` / `AGENT_MEMORY_USER_PATH`：core 记忆文件路径（默认位于 core 目录，见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L59-L84)）。
+
+### 1.1.5 运行时控制（递归深度）
+
+- `AGENT_RECURSION_LIMIT`：LangGraph 的 recursion_limit（默认 64，范围 10~500，见 [runtime.py](file:///g:/AI/agent-cli/agents/runtime.py#L190-L198) 与 [terminal_display.py](file:///g:/AI/agent-cli/terminal_display.py#L242-L259)）。
+
 ## 2. 项目结构
 
 ```
@@ -28,9 +71,9 @@ agent-cli/
 │   ├── model.py                 # 模型初始化
 │   └── __init__.py
 ├── skills/                      # 技能目录（用户自定义）
-├── skills_manager.py            # 技能管理器（安装、发现、状态）
-├── skills_support.py            # 技能发现、中间件、目录构建
-├── skills_state.py              # 技能状态持久化
+│   ├── skills_manager.py            # 技能管理器（安装、发现、状态）
+│   ├── skills_support.py            # 技能发现、中间件、目录构建
+│   ├── skills_state.py              # 技能状态持久化
 ├── tools.py                     # 核心工具集（文件读写、命令执行等）
 ├── terminal_display.py          # 终端显示与交互
 ├── sysinfo.py                   # 系统信息收集
@@ -145,9 +188,10 @@ agent-cli/
 
 - **文件操作**：`read_file`、`write_file`、`write_project_file`、`delete_path`、`list_dir`
 - **命令执行**：`Bash`、`run_cli`（支持超时和流式输出）
-- **记忆操作**：`memory_core_append`、`memory_user_write`、`memory_kg_recall` 等
+- **记忆操作**：`memory_core_read`、`memory_core_append`、`memory_core_write`、`memory_kg_recall` 等
 - **安全限制**：禁止访问敏感文件（`.env`、`.git`、密钥文件等），禁止越权访问项目根目录之外
 - **操作日志**：所有工具调用记录到 `ACTION_LOG`，用于终端显示和调试
+- **调用约定**：优先使用 `tool.invoke({...})`；同时兼容 `tool(**kwargs)` / `tool(dict)` 形式
 
 ### 3.6 终端显示 (terminal_display.py)
 

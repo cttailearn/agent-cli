@@ -1,16 +1,74 @@
 import asyncio
+import inspect
 import json
 import os
 import re
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from fnmatch import fnmatch
-from langchain.tools import tool
+from langchain_core.tools import tool
 from pathlib import Path
 
 
 ACTION_LOG: list[dict[str, object]] = []
+
+try:
+    from langchain_core.tools import BaseTool
+    from langchain_core.tools.structured import StructuredTool
+
+    def _tool_arg_names(t: BaseTool) -> list[str]:
+        schema = getattr(t, "args_schema", None)
+        if schema is not None:
+            model_fields = getattr(schema, "model_fields", None)
+            if isinstance(model_fields, dict) and model_fields:
+                return list(model_fields.keys())
+            fields_v1 = getattr(schema, "__fields__", None)
+            if isinstance(fields_v1, dict) and fields_v1:
+                return list(fields_v1.keys())
+
+        fn = getattr(t, "func", None)
+        if callable(fn):
+            try:
+                sig = inspect.signature(fn)
+            except (TypeError, ValueError):
+                return []
+            names: list[str] = []
+            for p in sig.parameters.values():
+                if p.name == "self":
+                    continue
+                if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY):
+                    names.append(p.name)
+            return names
+        return []
+
+    def _base_tool_call(self: BaseTool, *args, **kwargs):
+        if len(args) == 1 and not kwargs and isinstance(args[0], dict):
+            return self.invoke(args[0])
+        if args:
+            names = _tool_arg_names(self)
+            if not names:
+                if len(args) == 1 and not kwargs:
+                    return self.invoke({"input": args[0]})
+                raise TypeError("Tools must be called with keyword arguments or a single dict argument.")
+
+            remaining = [n for n in names if n not in kwargs]
+            if len(args) > len(remaining):
+                raise TypeError("Tools must be called with keyword arguments or a single dict argument.")
+            payload = dict(kwargs)
+            for n, v in zip(remaining, args):
+                payload[n] = v
+            return self.invoke(payload)
+
+        return self.invoke(kwargs)
+
+    if "__call__" not in BaseTool.__dict__:
+        BaseTool.__call__ = _base_tool_call  # type: ignore[assignment]
+    if "__call__" not in StructuredTool.__dict__:
+        StructuredTool.__call__ = _base_tool_call  # type: ignore[assignment]
+except Exception:
+    pass
 
 
 _SENSITIVE_FILENAMES = {
@@ -1285,6 +1343,26 @@ def memory_core_append(kind: str, content: str) -> str:
         return "OK"
     except OSError as e:
         _log_action({"kind": "memory_core_append", "ok": False, "path": p.as_posix(), "error": str(e), "ts": time.time()})
+        return f"Write failed: {e}"
+
+@tool
+def memory_core_write(kind: str, content: str) -> str:
+    """Overwrite core memory markdown: soul / traits / identity / user."""
+    try:
+        from memory.paths import core_file_by_kind
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = core_file_by_kind(_memory_project_root(), kind)
+    if p is None:
+        return "Unknown kind. Use soul|traits|identity|user."
+    p.parent.mkdir(parents=True, exist_ok=True)
+    text = (content or "").strip()
+    try:
+        p.write_text(f"{text}\n" if text else "", encoding="utf-8", errors="replace")
+        _log_action({"kind": "memory_core_write", "ok": True, "path": p.as_posix(), "size": len(text), "ts": time.time()})
+        return "OK"
+    except OSError as e:
+        _log_action({"kind": "memory_core_write", "ok": False, "path": p.as_posix(), "error": str(e), "ts": time.time()})
         return f"Write failed: {e}"
 
 

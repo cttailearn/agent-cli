@@ -183,7 +183,28 @@ class SkillMiddleware(AgentMiddleware):
         self.tools = tools
 
     def wrap_model_call(self, request: ModelRequest, handler):
-        base_text = request.system_message.text if request.system_message is not None else ""
+        base_text = ""
+        if request.system_message is not None:
+            msg = request.system_message
+            text_attr = getattr(msg, "text", None)
+            if isinstance(text_attr, str):
+                base_text = text_attr
+            else:
+                content = getattr(msg, "content", "") or ""
+                if isinstance(content, str):
+                    base_text = content
+                elif isinstance(content, list):
+                    parts: list[str] = []
+                    for item in content:
+                        if isinstance(item, str):
+                            parts.append(item)
+                        elif isinstance(item, dict):
+                            t = item.get("text")
+                            if isinstance(t, str) and t:
+                                parts.append(t)
+                    base_text = "".join(parts)
+                else:
+                    base_text = str(content)
         marker = "## Available Skills"
 
         skills_addendum = "\n".join(

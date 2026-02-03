@@ -1,0 +1,19 @@
+{
+  "disabled": {},
+  "installed": {
+    "system-monitor": {
+      "source": "local:create",
+      "ts": 1770127938.3343031
+    }
+  },
+  "usage": {
+    "\"system-monitor\"": {
+      "last_loaded_ts": 1770127991.588907,
+      "load_count": 2
+    },
+    "find-skills": {
+      "last_loaded_ts": 1770130890.5766795,
+      "load_count": 4
+    }
+  }
+}

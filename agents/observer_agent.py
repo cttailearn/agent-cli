@@ -10,7 +10,7 @@ from skills.skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
 
 from memory import load_core_prompt
 
-from agents.tools import memory_core_read, memory_kg_recall, memory_kg_stats, memory_user_read, memory_user_write
+from agents.tools import memory_core_read, memory_kg_recall, memory_kg_stats, memory_user_read
 
 from .runtime import _format_tools, _init_model, _run_agent_to_text, _summarize_tool_output_for_terminal
 
@@ -141,6 +141,25 @@ def build_observer_agent(
         )
 
     @tool
+    def write_core_memory(kind: str, content: str) -> str:
+        """Delegate to executor to overwrite core memory markdown."""
+        k = (kind or "").strip()
+        text = (content or "").strip()
+        if not k:
+            return "Missing kind."
+        return delegate_to_executor(
+            "\n".join(
+                [
+                    "请将以下内容写入项目 core 记忆 Markdown（覆盖写入）。",
+                    "要求：只调用一次 memory_core_write(kind, content)，并返回调用结果。",
+                    f"kind={k}",
+                    "content:",
+                    text,
+                ]
+            )
+        )
+
+    @tool
     def start_supervision(task: str) -> str:
         """Start supervision for a complex task and return task_id."""
         nonlocal last_supervision_task_id
@@ -256,13 +275,13 @@ def build_observer_agent(
             forget,
             memory_core_read,
             memory_user_read,
-            memory_user_write,
             memory_kg_recall,
             memory_kg_stats,
             is_complex_task,
             delegate_to_executor,
             delegate_to_supervisor,
             append_core_memory,
+            write_core_memory,
             start_supervision,
             supervised_check,
             finish_supervision,
@@ -273,16 +292,19 @@ def build_observer_agent(
         [
             BASE_SYSTEM_PROMPT,
             "你是一个观察者（Observer）。你负责与用户对话、理解意图、规划步骤、维护会话记忆。",
-            "所有会产生副作用的执行（写文件、改代码、运行命令、调用外部工具）必须委派给执行者。",
-            "你可以使用 delegate_to_executor(task) 让执行者完成具体工作，并基于其返回结果与用户沟通。",
-            "复杂任务时必须启动监督者：先调用 start_supervision(task) 获取 task_id，再在每次执行后调用 supervised_check(task_id, executor_result)。",
-            "只有当监督者判断任务完成后，才调用 finish_supervision(task_id) 清理监督者的任务记忆。",
+            "所有会产生副作用的执行（写文件、改代码、运行命令、调用外部工具）必须通过内部执行接口完成（例如 delegate_to_executor）。",
+            "对用户只输出你自己的自然语言结果：不要提及内部角色、委派、监督、执行链路、工具名或任何实现细节。",
+            "严禁出现或近似表达：让我委派给监督者/执行者、我去叫监督者/执行者、我把任务交给监督者/执行者、后台由监督者/执行者处理。",
+            "复杂任务时必须在内部启用监督流程：先调用 start_supervision(task) 获取 task_id，并在每次执行后调用 supervised_check(task_id, executor_result)，完成后调用 finish_supervision(task_id)。",
             "你可以使用 remember/recall/forget 管理你自己的会话记忆。",
             "灵魂/特性/身份：始终以 memory_core_read 读取的 core 记忆为准，并在关键决策时对齐。",
-            "当用户要求设定/修改你的身体、性格、表达风格、身份边界、原则时，你必须把稳定信息写入 core 记忆：用 append_core_memory(kind, content) 委派执行者追加写入（identity/traits/soul）。",
+            "每次会话开始时，先用 memory_core_read 分别读取 identity 与 traits：若内容仍是默认模板/信息为空/缺少明确的名字或表达风格，则在与你的正常回复里自然插入一次简短引导（2~4 轮问题）。引导结束后把稳定信息写入 core：identity（包含名字、边界，并追加一行 onboarding_status: done）、traits（表达风格/协作方式）、user（用户偏好与目标摘要）。",
+            "当用户要求设定/修改你的身体、性格、表达风格、身份边界、原则时，你必须把稳定信息写入 core 记忆：用 append_core_memory(kind, content) 委派执行者追加写入（identity/traits/soul/user）。需要覆盖写入时，使用 write_core_memory(kind, content)。",
             "只有当 append_core_memory 返回 OK 时，你才可以对用户说“已保存/已写入”。",
+            "当用户希望沉淀流程、补齐能力、优化技能生态时，在内部使用 delegate_to_supervisor 去完成 create/find/install/enable/disable 等动作；对用户只陈述最终结果与必要的操作说明。",
             "需要回忆长期事实、偏好、人物/项目关系时，先调用 memory_kg_recall(query) 检索知识图谱。",
             "你只能使用查看与委派类工具，不得直接调用任何项目读写或命令执行类工具。",
+            "当你与执行者或者监督者交互时，不得告诉用户，必须让用户觉得一直在与你交互",
             "严禁虚构已执行的动作：除非执行者确实通过工具产生了可验证的结果，否则不要声称“已创建/已运行/已完成”。",
             f"执行者通过 write_file 工具生成的任何文件都必须写入该目录：{output_dir.as_posix()}",
             f"执行者可以通过 read_file/list_dir/write_project_file/delete_path 工具读取与修改项目目录：{project_root.as_posix()}",

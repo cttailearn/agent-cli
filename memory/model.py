@@ -22,5 +22,10 @@ def init_model(model_name: str):
     if normalized.startswith("deepseek:"):
         deepseek_model_name = normalized.split(":", 1)[1]
         return ChatDeepSeek(model=deepseek_model_name, streaming=False)
-    return init_chat_model(model=normalized, streaming=False)
+    try:
+        return init_chat_model(model=normalized, streaming=False)
+    except ValueError as e:
+        if "Unable to infer model provider" not in str(e):
+            raise
+        return init_chat_model(model=normalized, model_provider="openai", streaming=False)
 

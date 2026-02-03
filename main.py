@@ -74,6 +74,9 @@ def main() -> None:
         work_dir = (project_root / work_dir).resolve()
     else:
         work_dir = work_dir.resolve()
+    if work_dir.exists() and not work_dir.is_dir():
+        raise RuntimeError(f"work_dir is not a directory: {work_dir}")
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     mcp_config = Path(args.mcp_config).expanduser() if args.mcp_config else Path("mcp/config.json")
     if not mcp_config.is_absolute():
@@ -98,39 +101,37 @@ def main() -> None:
             p = p.resolve()
         return p
 
-    def _resolve_skills_dir(raw: str) -> Path:
-        p = Path(raw).expanduser()
-        if p.is_absolute():
-            return p.resolve()
-        a = (project_root / p).resolve()
-        if a.exists():
-            return a
-        b = (script_root / p).resolve()
-        if b.exists():
-            return b
-        return a
-
     skills_dirs_raw = (args.skills_dirs or "").strip()
     if skills_dirs_raw:
         parts = [s.strip() for s in re.split(r"[;,]+", skills_dirs_raw) if s.strip()]
-        skills_dirs = [_resolve_skills_dir(s) for s in parts]
-        project_skills_dir = skills_dirs[0] if skills_dirs else _resolve_skills_dir(args.skills_dir)
+        skills_dirs = [_resolve_dir(project_root, s) for s in parts]
+        project_skills_dir = skills_dirs[0] if skills_dirs else _resolve_dir(project_root, args.skills_dir)
     else:
-        project_skills_dir = _resolve_skills_dir(args.skills_dir)
+        project_skills_dir = _resolve_dir(project_root, args.skills_dir)
         skills_dirs = [project_skills_dir]
+
+    project_skills_dir.mkdir(parents=True, exist_ok=True)
+
+    script_skills_dir = _resolve_dir(script_root, args.skills_dir)
+    if script_skills_dir.exists() and script_skills_dir not in {p.resolve() for p in skills_dirs}:
+        skills_dirs.append(script_skills_dir)
 
     global_skills_dir = (Path.home() / ".agents" / "skills").resolve()
     if global_skills_dir.exists() and global_skills_dir not in {p.resolve() for p in skills_dirs}:
         skills_dirs.append(global_skills_dir)
 
-    agent, skill_catalog_text, skill_count = build_agent(
-        skills_dirs=skills_dirs,
-        project_root=project_root,
-        output_dir=output_dir,
-        work_dir=work_dir,
-        model_name=args.model,
-    )
-    state = CliState(skill_catalog_text=skill_catalog_text, skill_count=skill_count)
+    def _build_observer() -> tuple[object, CliState]:
+        observer, catalog, count = build_agent(
+            skills_dirs=skills_dirs,
+            project_root=project_root,
+            output_dir=output_dir,
+            work_dir=work_dir,
+            model_name=args.model,
+        )
+        return observer, CliState(skill_catalog_text=catalog, skill_count=count)
+
+    agent, state = _build_observer()
+
     system_manager: SystemManager | None = None
     try:
         system_manager = SystemManager(
