@@ -9,8 +9,6 @@ from pathlib import Path
 
 from langchain_core.messages import (
     AIMessageChunk,
-    BaseMessage,
-    BaseMessageChunk,
     ToolMessage,
     ToolMessageChunk,
 )
@@ -23,6 +21,7 @@ from agents.runtime import (
     get_token_usage,
     reset_estimated_token_usage,
     reset_token_usage,
+    _extract_text,
     _stream_text_delta,
 )
 from agents.tools import action_log_snapshot, actions_since, action_scope, delete_path, list_dir, read_file, run_cli
@@ -83,54 +82,6 @@ def _format_actions(actions: list[dict[str, object]]) -> str:
         else:
             lines.append(f"- {a}")
     return "\n".join(lines)
-
-
-def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
-    content = getattr(msg, "content", "") or ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str) and text:
-                    parts.append(text)
-        if not parts:
-            return ""
-        if len(parts) == 1:
-            return parts[0]
-        kept_rev: list[str] = []
-        for s in reversed(parts):
-            if any(k.startswith(s) for k in kept_rev):
-                continue
-            kept_rev.append(s)
-        kept = list(reversed(kept_rev))
-
-        assembled = ""
-        for s in kept:
-            if not assembled:
-                assembled = s
-                continue
-            if s.startswith(assembled):
-                assembled = s
-                continue
-            if assembled.endswith(s):
-                continue
-            max_k = min(len(assembled), len(s))
-            k_found = 0
-            for k in range(max_k, 0, -1):
-                if assembled.endswith(s[:k]):
-                    k_found = k
-                    break
-            if k_found:
-                assembled += s[k_found:]
-            else:
-                assembled += s
-        return assembled
-    return str(content)
 
 
 def _summarize_actions(actions: list[dict[str, object]]) -> str:

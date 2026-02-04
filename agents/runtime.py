@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -175,10 +176,128 @@ def count_skills_in_catalog_text(skill_catalog_text: str) -> int:
     return sum(1 for line in lines if line.startswith("- "))
 
 
+def _maybe_collapse_stutter(text: str) -> str:
+    s = text or ""
+    if len(s) < 12:
+        return s
+
+    def _allow_ws_join_for_single_char(ch: str) -> bool:
+        if not ch:
+            return False
+        if "\u4e00" <= ch <= "\u9fff":
+            return True
+        if ch.isalnum():
+            return False
+        return True
+
+    repeats = 0
+    repeats_ge2 = 0
+    repeats_ge3 = 0
+    distinct: set[str] = set()
+    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in s)
+    max_seg_len = min(12, max(1, len(s) // 4))
+    for seg_len in range(1, max_seg_len + 1):
+        i = 0
+        while i + 2 * seg_len <= len(s):
+            a = s[i : i + seg_len]
+            b = s[i + seg_len : i + 2 * seg_len]
+            if a and a == b:
+                repeats += 1
+                if seg_len >= 2:
+                    repeats_ge2 += 1
+                if seg_len >= 3:
+                    repeats_ge3 += 1
+                if len(distinct) < 12:
+                    distinct.add(a)
+                i += seg_len * 2
+                continue
+            if i + seg_len < len(s) and s[i + seg_len].isspace():
+                if seg_len == 1 and not _allow_ws_join_for_single_char(a):
+                    i += 1
+                    continue
+                j = i + seg_len
+                while j < len(s) and s[j].isspace():
+                    j += 1
+                if j + seg_len <= len(s):
+                    b2 = s[j : j + seg_len]
+                    if a and a == b2:
+                        repeats += 1
+                        if seg_len >= 2:
+                            repeats_ge2 += 1
+                        if seg_len >= 3:
+                            repeats_ge3 += 1
+                        if len(distinct) < 12:
+                            distinct.add(a)
+                        i = j + seg_len
+                        continue
+            i += 1
+
+    if repeats < 2:
+        return s
+
+    if has_cjk:
+        if repeats_ge2 < 1 and repeats < 4:
+            return s
+    else:
+        if repeats_ge3 < 2 and (repeats < 6 or len(distinct) < 3):
+            return s
+        if repeats_ge3 < 2 and len(distinct) < 2:
+            return s
+
+    if len(distinct) < 1:
+        return s
+
+    out: list[str] = []
+    i = 0
+    longest = min(24, max(8, len(s) // 3))
+    while i < len(s):
+        collapsed = False
+        for seg_len in range(longest, 0, -1):
+            if i + 2 * seg_len > len(s):
+                continue
+            a = s[i : i + seg_len]
+            b = s[i + seg_len : i + 2 * seg_len]
+            if a and a == b:
+                out.append(a)
+                j = i + seg_len * 2
+                while j + seg_len <= len(s) and s[j : j + seg_len] == a:
+                    j += seg_len
+                i = j
+                collapsed = True
+                break
+            if i + seg_len < len(s) and s[i + seg_len].isspace():
+                if seg_len == 1 and not _allow_ws_join_for_single_char(a):
+                    continue
+                j = i + seg_len
+                while j < len(s) and s[j].isspace():
+                    j += 1
+                if j + seg_len <= len(s) and a and s[j : j + seg_len] == a:
+                    out.append(a)
+                    j2 = j + seg_len
+                    while True:
+                        if j2 + seg_len <= len(s) and s[j2 : j2 + seg_len] == a:
+                            j2 += seg_len
+                            continue
+                        k = j2
+                        while k < len(s) and s[k].isspace():
+                            k += 1
+                        if k != j2 and k + seg_len <= len(s) and s[k : k + seg_len] == a:
+                            j2 = k + seg_len
+                            continue
+                        break
+                    i = j2
+                    collapsed = True
+                    break
+        if not collapsed:
+            out.append(s[i])
+            i += 1
+    return "".join(out)
+
+
 def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
     content = getattr(msg, "content", "") or ""
     if isinstance(content, str):
-        return content
+        return _maybe_collapse_stutter(content)
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -191,10 +310,22 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
         if not parts:
             return ""
         if len(parts) == 1:
-            return parts[0]
+            return _maybe_collapse_stutter(parts[0])
+
+        uniq: list[str] = []
+        for s in parts:
+            if s not in uniq:
+                uniq.append(s)
+        parts = uniq
+
+        parts_by_len = sorted(parts, key=len, reverse=True)
+        for candidate in parts_by_len:
+            if all((p in candidate) for p in parts):
+                return _maybe_collapse_stutter(candidate)
+
         kept_rev: list[str] = []
         for s in reversed(parts):
-            if any(k.startswith(s) for k in kept_rev):
+            if any(s and s in k for k in kept_rev):
                 continue
             kept_rev.append(s)
         kept = list(reversed(kept_rev))
@@ -219,8 +350,49 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
                 assembled += s[k_found:]
             else:
                 assembled += s
-        return assembled
-    return str(content)
+        return _maybe_collapse_stutter(assembled)
+    return _maybe_collapse_stutter(str(content))
+
+
+def self_test_extract_text_dedup() -> bool:
+    class _Msg:
+        def __init__(self, content: object) -> None:
+            self.content = content
+
+    cases: list[tuple[object, str]] = [
+        (["按照", "我将按照"], "我将按照"),
+        (["我将", "按照", "我将按照"], "我将按照"),
+        (["Markdown", "Markdown"], "Markdown"),
+        (["foo", "bar"], "foobar"),
+        ([{"text": "按照"}, {"text": "我将按照"}], "我将按照"),
+        (["主人", "主人", "，", "，", "我来", "我来"], "主人，我来"),
+        (["主人", "主人，", "主人，我来"], "主人，我来"),
+        (["主人主人，，我来我来为您为您搜索前端搜索前端设计相关的设计相关的技能。"], "主人，我来为您搜索前端设计相关的技能。"),
+        ("主人主人，，我来我来检查浏览器检查浏览器自动化技能自动化技能的 setup.json setup.json 文件 文件状态。", "主人，我来检查浏览器自动化技能的 setup.json 文件状态。"),
+        ("npx npx skills find skills find frontend design", "npx skills find frontend design"),
+        ("bookkeeper", "bookkeeper"),
+    ]
+    for content, expected in cases:
+        if _extract_text(_Msg(content)) != expected:
+            return False
+    return True
+
+
+class _LockedProxy:
+    def __init__(self, obj: object) -> None:
+        self._obj = obj
+        self._lock = threading.RLock()
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._obj, name)
+        if not callable(attr):
+            return attr
+
+        def _wrapped(*args, **kwargs):
+            with self._lock:
+                return attr(*args, **kwargs)
+
+        return _wrapped
 
 
 def _summarize_tool_output_for_terminal(raw: str) -> str:
@@ -618,7 +790,17 @@ def build_agent(
     try:
         from langgraph.store.sqlite import SqliteStore
 
-        store_conn = sqlite3.connect(str((agents_dir / "store.sqlite").resolve()), check_same_thread=False)
+        store_conn = sqlite3.connect(
+            str((agents_dir / "store.sqlite").resolve()),
+            check_same_thread=False,
+            timeout=30.0,
+        )
+        try:
+            store_conn.execute("PRAGMA journal_mode=WAL;")
+            store_conn.execute("PRAGMA synchronous=NORMAL;")
+            store_conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
         store = SqliteStore(store_conn)
         store.setup()
     except Exception:
@@ -629,12 +811,24 @@ def build_agent(
     try:
         from langgraph.checkpoint.sqlite import SqliteSaver
 
-        checkpoint_conn = sqlite3.connect(str((agents_dir / "checkpoints.sqlite").resolve()), check_same_thread=False)
+        checkpoint_conn = sqlite3.connect(
+            str((agents_dir / "checkpoints.sqlite").resolve()),
+            check_same_thread=False,
+            timeout=30.0,
+        )
+        try:
+            checkpoint_conn.execute("PRAGMA journal_mode=WAL;")
+            checkpoint_conn.execute("PRAGMA synchronous=NORMAL;")
+            checkpoint_conn.execute("PRAGMA busy_timeout=5000;")
+        except Exception:
+            pass
         checkpointer = SqliteSaver(checkpoint_conn)
     except Exception:
         from langgraph.checkpoint.memory import InMemorySaver
 
         checkpointer = InMemorySaver()
+
+    store = _LockedProxy(store)
 
     from .executor_agent import build_executor_agent, executor_tools
     from .observer_agent import build_observer_agent
