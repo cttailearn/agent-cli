@@ -6,6 +6,7 @@ __pycache__/
 *.pyd
 .env
 .env.*
+workspace/*
 db/*.db
 out/*
 dist/
