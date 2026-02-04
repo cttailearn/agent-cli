@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import sys
 from pathlib import Path
 
 import dotenv
@@ -17,31 +18,40 @@ dotenv.load_dotenv()
 
 
 def main() -> None:
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--skills-dir",
         default=os.environ.get("AGENT_SKILLS_DIR", "skills"),
-        help="skills 目录（默认：AGENT_SKILLS_DIR，否则 skills）",
+        help="skills 目录（默认：AGENT_SKILLS_DIR，否则 skills；相对智能体根目录或绝对路径）",
     )
     parser.add_argument(
         "--skills-dirs",
         default=os.environ.get("AGENT_SKILLS_DIRS", ""),
-        help="skills 目录列表（; 或 , 分隔；相对 project-dir 或绝对路径）",
+        help="skills 目录列表（; 或 , 分隔；相对智能体根目录或绝对路径）",
     )
     parser.add_argument(
         "--project-dir",
         default=os.environ.get("AGENT_PROJECT_DIR", ""),
-        help="项目根目录（默认：脚本所在目录）",
+        help="智能体根目录（默认：脚本所在目录下的 workspace/；为空时自动创建）",
     )
     parser.add_argument(
         "--output-dir",
         default=os.environ.get("AGENT_OUTPUT_DIR", "out"),
-        help="智能体生成文件的输出目录（默认：环境变量 AGENT_OUTPUT_DIR，否则 ./out）",
+        help="智能体生成文件的输出目录（默认：环境变量 AGENT_OUTPUT_DIR，否则 ./out；相对智能体根目录或绝对路径）",
     )
     parser.add_argument(
         "--work-dir",
         default=os.environ.get("AGENT_WORK_DIR", ""),
-        help="命令执行工作目录（默认：project-dir）",
+        help="命令执行工作目录（默认：智能体根目录；相对智能体根目录或绝对路径）",
     )
     parser.add_argument(
         "--model",
@@ -51,14 +61,24 @@ def main() -> None:
     parser.add_argument(
         "--mcp-config",
         default=os.environ.get("AGENT_MCP_CONFIG", "mcp/config.json"),
-        help="MCP 配置文件路径（相对 project-dir 或绝对路径）",
+        help="MCP 配置文件路径（相对智能体根目录或绝对路径）",
     )
     parser.add_argument("prompt", nargs="*", help="单次执行的提示词；不传则进入交互模式")
     args = parser.parse_args()
 
+    model_name = (args.model or "").strip()
+    if model_name.lower().startswith("deepseek:"):
+        key = (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+        if not key or key.lower() in {"sk-xxxx", "sk-xxx", "sk-0000"}:
+            raise RuntimeError(
+                "未配置有效的 DEEPSEEK_API_KEY。请在 .env 中设置 DEEPSEEK_API_KEY，或将 LC_MODEL/--model 切换为 OpenAI 兼容模型并配置 OPENAI_API_KEY。"
+            )
+
     script_root = Path(__file__).resolve().parent
-    project_root = Path(args.project_dir).expanduser() if args.project_dir else script_root
+    project_root = Path(args.project_dir).expanduser() if args.project_dir else (script_root / "workspace")
     project_root = project_root.resolve()
+    project_root.mkdir(parents=True, exist_ok=True)
+    (project_root / ".agents").mkdir(parents=True, exist_ok=True)
 
     ensure_memory_scaffold(project_root)
 
@@ -88,9 +108,13 @@ def main() -> None:
     os.environ["AGENT_OUTPUT_DIR"] = str(output_dir)
     os.environ["AGENT_WORK_DIR"] = str(work_dir)
     os.environ["AGENT_MCP_CONFIG"] = str(mcp_config)
+    os.environ["AGENT_MODEL_NAME"] = str(args.model or "")
+    os.environ.setdefault("AGENT_STREAM_DELEGATION", "1")
+    os.environ.setdefault("AGENT_STREAM_SUBPROCESS", "1")
     os.chdir(work_dir)
 
     memory_manager = MemoryManager(project_root=project_root, model_name=args.model)
+    os.environ["AGENT_THREAD_ID"] = memory_manager.session_id
     memory_manager.start()
 
     def _resolve_dir(base: Path, raw: str) -> Path:
@@ -101,20 +125,21 @@ def main() -> None:
             p = p.resolve()
         return p
 
+    skills_dirs: list[Path] = []
+
     skills_dirs_raw = (args.skills_dirs or "").strip()
     if skills_dirs_raw:
         parts = [s.strip() for s in re.split(r"[;,]+", skills_dirs_raw) if s.strip()]
-        skills_dirs = [_resolve_dir(project_root, s) for s in parts]
-        project_skills_dir = skills_dirs[0] if skills_dirs else _resolve_dir(project_root, args.skills_dir)
-    else:
-        project_skills_dir = _resolve_dir(project_root, args.skills_dir)
-        skills_dirs = [project_skills_dir]
+        skills_dirs.extend([_resolve_dir(project_root, s) for s in parts])
 
+    project_skills_dir = _resolve_dir(project_root, args.skills_dir)
+    if project_skills_dir not in {p.resolve() for p in skills_dirs}:
+        skills_dirs.insert(0, project_skills_dir)
     project_skills_dir.mkdir(parents=True, exist_ok=True)
 
-    script_skills_dir = _resolve_dir(script_root, args.skills_dir)
-    if script_skills_dir.exists() and script_skills_dir not in {p.resolve() for p in skills_dirs}:
-        skills_dirs.append(script_skills_dir)
+    built_in_skills_dir = (script_root / "skills").resolve()
+    if built_in_skills_dir.exists() and built_in_skills_dir not in {p.resolve() for p in skills_dirs}:
+        skills_dirs.append(built_in_skills_dir)
 
     global_skills_dir = (Path.home() / ".agents" / "skills").resolve()
     if global_skills_dir.exists() and global_skills_dir not in {p.resolve() for p in skills_dirs}:
@@ -183,9 +208,7 @@ def main() -> None:
                     break
                 if local_action is not None:
                     continue
-                messages.append({"role": "user", "content": user_text})
-                assistant_text = stream_assistant_reply(agent, messages, state)
-                messages.append({"role": "assistant", "content": assistant_text})
+                assistant_text = stream_assistant_reply(agent, [{"role": "user", "content": user_text}], state)
                 usage = state.last_token_usage or {}
                 if usage:
                     label = "tokens(估算)" if state.last_token_usage_is_estimate else "tokens"

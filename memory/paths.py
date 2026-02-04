@@ -42,6 +42,13 @@ def chats_dir(project_root: Path) -> Path:
     return (memory_root(project_root) / "chats").resolve()
 
 
+def episodic_dir(project_root: Path) -> Path:
+    raw = (os.environ.get("AGENT_MEMORY_EPISODIC_DIR") or "").strip()
+    if raw:
+        return _resolve_path(project_root, raw)
+    return (memory_root(project_root) / "episodic").resolve()
+
+
 def kg_dir(project_root: Path) -> Path:
     raw = (os.environ.get("AGENT_MEMORY_KG_DIR") or "").strip()
     if raw:

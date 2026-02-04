@@ -16,11 +16,11 @@
 
 ### 1.1.1 基础路径配置（main.py）
 
-- `AGENT_PROJECT_DIR`：项目根目录；为空时默认 `main.py` 所在目录（见 [main.py](file:///g:/AI/agent-cli/main.py#L59-L62)）。
-- `AGENT_OUTPUT_DIR`：输出目录；默认 `out`（见 [main.py](file:///g:/AI/agent-cli/main.py#L37-L40)）。
-- `AGENT_WORK_DIR`：命令执行工作目录；默认等同项目根目录（见 [main.py](file:///g:/AI/agent-cli/main.py#L72-L77)）。
-- `AGENT_SKILLS_DIR`：skills 目录；默认 `skills`（见 [main.py](file:///g:/AI/agent-cli/main.py#L21-L25)）。
-- `AGENT_SKILLS_DIRS`：skills 目录列表（`;` 或 `,` 分隔）；不填则只使用 `AGENT_SKILLS_DIR`（见 [main.py](file:///g:/AI/agent-cli/main.py#L113-L121)）。
+- `AGENT_PROJECT_DIR`：智能体根目录（工作区根）；为空时默认 `main.py` 同级目录下的 `workspace/`（启动时自动创建，见 [main.py](file:///d:/tools/agent-cli/main.py#L59-L64)）。
+- `AGENT_OUTPUT_DIR`：输出目录；默认 `out`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L67-L72)）。
+- `AGENT_WORK_DIR`：命令执行工作目录；默认等同智能体根目录（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L74-L81)）。
+- `AGENT_SKILLS_DIR`：项目技能目录；默认 `skills`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L21-L25)）。
+- `AGENT_SKILLS_DIRS`：技能目录列表（`;` 或 `,` 分隔）；相对路径均按智能体根目录解析；不填则只使用 `AGENT_SKILLS_DIR`（并自动追加内置技能目录与全局技能目录，见 [main.py](file:///d:/tools/agent-cli/main.py#L106-L124)）。
 
 ### 1.1.2 模型配置
 
@@ -34,7 +34,7 @@
 
 ### 1.1.3 MCP 配置
 
-- `AGENT_MCP_CONFIG`：MCP 配置文件路径（相对项目根目录或绝对路径；为空则不加载 MCP 工具，见 [load_mcp_tools_from_config](file:///g:/AI/agent-cli/agents/tools.py#L1128-L1136) 与 [main.py](file:///g:/AI/agent-cli/main.py#L78-L83)）。
+- `AGENT_MCP_CONFIG`：MCP 配置文件路径（相对智能体根目录或绝对路径；为空则不加载 MCP 工具，见 [load_mcp_tools_from_config](file:///d:/tools/agent-cli/agents/tools.py#L1186-L1199) 与 [main.py](file:///d:/tools/agent-cli/main.py#L83-L87)）。
 
 ### 1.1.4 记忆系统路径（memory/paths.py）
 
@@ -77,13 +77,15 @@ agent-cli/
 ├── tools.py                     # 核心工具集（文件读写、命令执行等）
 ├── terminal_display.py          # 终端显示与交互
 ├── sysinfo.py                   # 系统信息收集
-├── mcp/                         # 模型上下文协议配置
-├── .agents/skills_state.json    # 技能状态持久化文件
+├── mcp/                         # MCP 配置示例（可选；默认从 workspace/mcp/ 读取）
 ├── pyproject.toml               # 项目配置
 ├── README.md                    # 项目说明
 └── workspace/                   # 工作区（运行时生成）
+    ├── .agents/                 # 运行时状态（技能状态等）
+    ├── mcp/                     # MCP 配置（默认读取 workspace/mcp/config.json）
     ├── memory/                  # 记忆存储
-    └── out/                     # 输出目录
+    ├── out/                     # 输出目录
+    └── skills/                  # 项目技能目录（默认读取 workspace/skills/）
 ```
 
 ### 模块依赖关系
@@ -184,6 +186,69 @@ agent-cli/
 - **持久化**：将技能禁用状态、使用统计、安装记录保存到 `.agents/skills_state.json`
 - **状态管理**：提供 `is_disabled`、`disable_skill`、`enable_skill` 等接口
 
+#### 3.4.4 当用户要求“添加技能”时的工作流程（实现视角）
+
+这里的“添加技能”包含三类动作：安装生态技能（`npx skills add`）、查找生态技能（`npx skills find`）、创建本地技能（生成 `skills/<name>/SKILL.md`）。本项目把这些动作集中放在 Supervisor 侧执行，Observer 负责识别意图并委派。
+
+**A. 请求入口：用户 → Observer**
+
+- 用户提出“帮我添加/安装某个技能”“找一个技能来做 X”一类需求后，Observer 按系统提示把技能生态相关动作委派给 Supervisor（[delegate_to_supervisor](file:///d:/tools/agent-cli/agents/observer_agent.py#L110-L121)）。
+- 委派本质是一次独立的模型运行：Observer 在工具里调用 `_run_agent_to_text(supervisor_agent, ...)`，流式收集 Supervisor 输出（[_run_agent_to_text](file:///d:/tools/agent-cli/agents/runtime.py#L201-L236)）。
+
+**B. Supervisor 执行技能管理：Supervisor → SkillManager → 文件系统 / 子进程**
+
+- Supervisor 暴露了一组技能管理工具：`skills_find/skills_install/skills_create/skills_enable/skills_disable/skills_remove/...`（见 [supervisor_agent.py](file:///d:/tools/agent-cli/agents/supervisor_agent.py#L139-L183)）。
+- 这些工具都委托给 `SkillManager`（[SkillManager](file:///d:/tools/agent-cli/skills/skills_manager.py#L45-L229)）：
+  - 查找：`skills_find(query)` → `SkillManager.find_via_npx` → `subprocess.run("npx skills find ...")`（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L189-L199)）。
+  - 安装：`skills_install(spec)` → `SkillManager.install_via_npx` → `subprocess.run("npx skills add ... --dir <project_skills_dir>")`，安装后重新扫描新增技能并写入安装记录（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L173-L188)）。
+  - 本地创建：`skills_create(name, description, body)` → 在项目技能目录创建 `skills/<name>/SKILL.md` 并写入 Front Matter，随后记录 installed（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L124-L149)）。
+  - 禁用/启用/删除：通过 `.agents/skills_state.json` 维护 disabled 标记，或直接删除项目技能目录下的技能文件夹（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L98-L123)）。
+
+**C. 安装/创建后的“生效”机制：不需要重启进程**
+
+- 所有智能体在构建时共享同一个 `SkillMiddleware`（[build_agent](file:///d:/tools/agent-cli/agents/runtime.py#L283-L331)），中间件会在每次模型调用前把“技能目录摘要”注入到系统提示里（[SkillMiddleware.wrap_model_call](file:///d:/tools/agent-cli/skills/skills_support.py#L180-L231)）。
+- 技能目录摘要由 `_SkillIndex` 动态刷新：它通过扫描所有 `SKILL.md` 的 `(path, mtime, size)` 计算 fingerprint；一旦安装/创建导致 fingerprint 变化，就重建 manifests、技能名索引与目录文本（[_SkillIndex.refresh](file:///d:/tools/agent-cli/skills/skills_support.py#L141-L152)）。
+- 当模型确实需要某个技能的细节时，才调用 `load_skill(name)` 读取对应 `SKILL.md` 的正文内容（并去掉 Front Matter），且会在内存中缓存本次会话加载结果（[_SkillIndex.load_skill](file:///d:/tools/agent-cli/skills/skills_support.py#L158-L177)）。
+- `load_skill` 会同步写入 `.agents/skills_state.json` 的使用统计（[record_skill_loaded](file:///d:/tools/agent-cli/skills/skills_state.py#L81-L98)）。
+
+#### 3.4.5 为什么“添加技能”响应慢（关键路径与原因）
+
+“慢”通常不是单点原因，而是多段耗时叠加，尤其在 Windows + npx 的组合下更明显。
+
+**1) 多智能体委派带来的额外模型往返**
+
+- Observer 把“技能管理动作”交给 Supervisor 执行（[delegate_to_supervisor](file:///d:/tools/agent-cli/agents/observer_agent.py#L110-L121)），等价于一次额外的模型调用；如果 Supervisor 再进行多步工具调用（find → install → scan），总体时延会线性叠加。
+
+**2) `npx skills ...` 子进程（最常见的大头）**
+
+- `skills_find`/`skills_install` 直接启动 `npx`（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L173-L199)），其耗时取决于：
+  - 首次运行时的 npm/npx 自身初始化、下载与缓存命中情况。
+  - 网络（访问 npm registry / GitHub）与代理配置。
+  - Windows 下启动 PowerShell + Node + npx 的冷启动成本（每次 subprocess 都是新进程）。
+- 这类耗时与模型无关，哪怕模型很快，整体响应仍会被 subprocess 阻塞。
+
+**3) 每次模型调用都要“扫一遍技能目录”的 I/O 开销**
+
+- `SkillMiddleware` 每次 wrap 模型调用都会调用 `skills_prompt_supplier()`，而 `_SkillIndex.get_catalog_text()` 会触发 `refresh()`（[get_catalog_text](file:///d:/tools/agent-cli/skills/skills_support.py#L154-L156)）。
+- `refresh()` 的 fingerprint 计算会对所有技能目录递归 `rglob("SKILL.md")` 并逐个 `stat()`（[_compute_skill_fingerprint](file:///d:/tools/agent-cli/skills/skills_support.py#L116-L128)）。当技能数量上升、磁盘较慢、或目录在网络盘/杀软扫描下，这部分会变成可感知的延迟。
+
+**4) 提示词变长导致模型推理变慢（技能越多越明显）**
+
+- 技能目录摘要会被拼进每次模型调用的 system prompt（[SkillMiddleware.wrap_model_call](file:///d:/tools/agent-cli/skills/skills_support.py#L185-L231)）。
+- 当 skills 很多时，“Available skills”列表本身会显著增加输入 token，导致：网络传输更大、模型前处理更重、推理时间更长、费用更高。
+
+**5) `load_skill` 写状态文件的同步磁盘写入**
+
+- 每次 `load_skill` 都会调用 `record_skill_loaded`，它会 `load_state()` → 修改 usage → `save_state()` 写回 JSON（[skills_state.py](file:///d:/tools/agent-cli/skills/skills_state.py#L20-L46) 与 [record_skill_loaded](file:///d:/tools/agent-cli/skills/skills_state.py#L81-L98)）。
+- 如果模型在一个回合里多次加载技能（或反复触发同一技能的 load），会产生频繁的同步磁盘写入。
+
+**可操作的优化方向（不改语义的前提下）**
+
+- 缓解 `npx`：优先让技能安装走长期驻留的包管理进程（或复用 node 缓存目录），并把 `skills add/find` 改成一次性批处理；必要时在企业环境配置 registry mirror / 代理。
+- 减少目录扫描：为 `_compute_skill_fingerprint` 增加节流（例如 1~2 秒内不重复扫），或改为基于目录级 mtime 的粗粒度检查再按需深扫。
+- 控制提示词体积：把“Available skills”从全量列表改为 Top-N + “使用 list_skills 查询全量”，或按类别/最近使用排序输出。
+- 降低状态写入频率：将 `record_skill_loaded` 从“每次 load 都落盘”改为“内存累计 + 定时/退出时落盘”，或做最小化写入（仅当计数变化才写且合并写）。
+
 ### 3.5 工具集 (tools.py)
 
 - **文件操作**：`read_file`、`write_file`、`write_project_file`、`delete_path`、`list_dir`
@@ -267,7 +332,7 @@ agent-cli/
 
 - **环境变量优先**：支持通过环境变量覆盖默认配置
 - **命令行参数**：提供灵活的启动选项
-- **路径解析**：支持相对路径和绝对路径，自动解析到项目根目录
+- **路径解析**：支持相对路径和绝对路径，相对路径默认按智能体根目录解析
 
 ## 6. 潜在问题与改进点
 

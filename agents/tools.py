@@ -1,4 +1,5 @@
 import asyncio
+import contextvars
 import inspect
 import json
 import os
@@ -11,8 +12,29 @@ from fnmatch import fnmatch
 from langchain_core.tools import tool
 from pathlib import Path
 
+from .exec import build_langchain_exec_tools, sanitize_exec_env, sandbox_validate_command
+from . import console_print
+
 
 ACTION_LOG: list[dict[str, object]] = []
+_ACTION_SCOPE: contextvars.ContextVar[str] = contextvars.ContextVar("ACTION_SCOPE", default="")
+
+
+class _ActionScope:
+    def __init__(self, scope: str) -> None:
+        self._scope = scope
+        self._token: contextvars.Token[str] | None = None
+
+    def __enter__(self) -> None:
+        self._token = _ACTION_SCOPE.set((self._scope or "").strip())
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        if self._token is not None:
+            _ACTION_SCOPE.reset(self._token)
+
+
+def action_scope(scope: str) -> _ActionScope:
+    return _ActionScope(scope)
 
 try:
     from langchain_core.tools import BaseTool
@@ -89,14 +111,31 @@ def action_log_snapshot() -> int:
     return len(ACTION_LOG)
 
 
-def actions_since(snapshot: int) -> list[dict[str, object]]:
+def actions_since(snapshot: int, *, scope: str | None = None) -> list[dict[str, object]]:
     if snapshot <= 0:
-        return ACTION_LOG[:]
-    return ACTION_LOG[snapshot:]
+        out = ACTION_LOG[:]
+    else:
+        out = ACTION_LOG[snapshot:]
+    s = (scope or "").strip()
+    if not s:
+        return out
+    return [a for a in out if a.get("scope") == s]
 
 
 def _log_action(entry: dict[str, object]) -> None:
+    if "scope" not in entry:
+        entry["scope"] = _ACTION_SCOPE.get()
     ACTION_LOG.append(entry)
+
+
+def log_action(kind: str, ok: bool, **fields: object) -> None:
+    k = (kind or "").strip() or "unknown"
+    entry: dict[str, object] = {"kind": k, "ok": bool(ok), "ts": time.time()}
+    for fk, fv in fields.items():
+        if fk in {"kind", "ok", "ts"}:
+            continue
+        entry[fk] = fv
+    _log_action(entry)
 
 
 def _project_root() -> Path:
@@ -923,6 +962,20 @@ def run_cli(
     except ValueError:
         return f"Refusing to run outside work directory: {resolved_cwd.as_posix()}"
 
+    deny_reason = sandbox_validate_command(command=command, work_root=work_root, cwd=resolved_cwd)
+    if deny_reason:
+        _log_action(
+            {
+                "kind": "run_cli",
+                "ok": False,
+                "command": command,
+                "cwd": resolved_cwd.as_posix(),
+                "error": f"sandbox_denied:{deny_reason}",
+                "ts": time.time(),
+            }
+        )
+        return f"Sandbox denied: {deny_reason}"
+
     if os.name == "nt":
         cmd = [
             "powershell",
@@ -936,12 +989,15 @@ def run_cli(
     else:
         cmd = ["bash", "-lc", command]
 
+    env = sanitize_exec_env(dict(os.environ))
+
     try:
         if not stream:
             completed = subprocess.run(
                 cmd,
                 cwd=str(resolved_cwd),
                 capture_output=True,
+                env=env,
                 text=True,
                 encoding=encoding,
                 errors="replace",
@@ -952,12 +1008,13 @@ def run_cli(
             stderr = completed.stderr or ""
             exit_code = completed.returncode
         else:
-            print(f"$ {command}", flush=True)
+            console_print(f"$ {command}", flush=True, ensure_newline=True)
             process = subprocess.Popen(
                 cmd,
                 cwd=str(resolved_cwd),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                env=env,
                 text=True,
                 encoding=encoding,
                 errors="replace",
@@ -970,7 +1027,7 @@ def run_cli(
                 assert process.stdout is not None
                 for raw_line in process.stdout:
                     line = raw_line.rstrip("\n")
-                    print(line, flush=True)
+                    console_print(line, flush=True, ensure_newline=True)
                     with output_lock:
                         output_lines.append(line)
 
@@ -1095,6 +1152,8 @@ def _bash(command: str, timeout_s: int = 120, cwd: str | None = None, encoding: 
 
 Bash = tool("Bash")(_bash)
 
+Exec, Process = build_langchain_exec_tools()
+
 
 def _run_coroutine(coro):
     def _run_in_new_loop():
@@ -1130,10 +1189,11 @@ def _run_coroutine(coro):
 
     if running_loop.is_running():
         result_box: dict[str, object] = {}
+        ctx = contextvars.copy_context()
 
         def _thread_runner():
             try:
-                result_box["value"] = _run_in_new_loop()
+                result_box["value"] = ctx.run(_run_in_new_loop)
             except BaseException as e:
                 result_box["error"] = e
 
@@ -1364,6 +1424,19 @@ def memory_core_write(kind: str, content: str) -> str:
     except OSError as e:
         _log_action({"kind": "memory_core_write", "ok": False, "path": p.as_posix(), "error": str(e), "ts": time.time()})
         return f"Write failed: {e}"
+
+
+@tool
+def memory_episodic_append(content: str) -> str:
+    """Append one episodic memory entry into fragmented markdown (5 entries per file)."""
+    try:
+        from memory.manager import append_episodic_memory
+    except Exception as e:
+        return f"Import failed: {e}"
+    model_name = (os.environ.get("AGENT_MODEL_NAME") or os.environ.get("LC_MODEL") or "deepseek:deepseek-reasoner").strip()
+    ok, msg = append_episodic_memory(project_root=_memory_project_root(), model_name=model_name, content=content)
+    _log_action({"kind": "memory_episodic_append", "ok": bool(ok), "result": msg, "ts": time.time()})
+    return msg if ok else f"Write failed: {msg}"
 
 
 @tool

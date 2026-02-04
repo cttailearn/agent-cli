@@ -39,7 +39,12 @@ class ObserverPromptTask(SystemTask):
     def run(self, ctx: SystemContext) -> str:
         prompt = self.prompt(ctx) if callable(self.prompt) else self.prompt
         user_text = f"[SYSTEM_TASK id={self.id}] {prompt}".strip()
-        assistant_text, tool_output = _run_agent_to_text(ctx.observer_agent, [{"role": "user", "content": user_text}])
+        assistant_text, tool_output = _run_agent_to_text(
+            ctx.observer_agent,
+            [{"role": "user", "content": user_text}],
+            checkpoint_ns="observer_system",
+            thread_id=f"system_{self.id}",
+        )
         summarized = _summarize_tool_output_for_terminal(tool_output)
         final_text = assistant_text
         if summarized:

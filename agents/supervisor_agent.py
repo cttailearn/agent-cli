@@ -5,6 +5,7 @@ import re
 import time
 from pathlib import Path
 
+from langgraph.prebuilt import ToolRuntime
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
@@ -14,17 +15,20 @@ from skills.skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
 
 from memory import load_core_prompt
 
-from .runtime import _format_tools, _init_model
+from .runtime import UnifiedAgentState, _format_tools, _init_model
 
 
 def build_supervisor_agent(
     *,
     model_name: str,
     skill_middleware: SkillMiddleware,
+    memory_middleware,
     skills_dirs: list[Path],
     project_root: Path,
     output_dir: Path,
     work_dir: Path,
+    store,
+    checkpointer,
 ):
     model = _init_model(model_name)
 
@@ -33,56 +37,97 @@ def build_supervisor_agent(
 
     tools: list[object] = []
 
+    def _runtime_thread_id(runtime: ToolRuntime) -> str:
+        cfg = getattr(runtime, "config", None) or {}
+        if isinstance(cfg, dict):
+            configurable = cfg.get("configurable") or {}
+            if isinstance(configurable, dict):
+                tid = (configurable.get("thread_id") or "").strip()
+                if tid:
+                    return tid
+        return "default"
+
+    def _get_task_record(runtime: ToolRuntime, tid: str) -> dict[str, object] | None:
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            existing = tasks.get(tid)
+            return existing if isinstance(existing, dict) else None
+        item = store_obj.get(("supervision", _runtime_thread_id(runtime)), tid)
+        if item is None:
+            return None
+        val = getattr(item, "value", None)
+        return dict(val) if isinstance(val, dict) else None
+
+    def _put_task_record(runtime: ToolRuntime, tid: str, record: dict[str, object]) -> None:
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            tasks[tid] = record
+            return
+        store_obj.put(("supervision", _runtime_thread_id(runtime)), tid, record)
+
+    def _delete_task_record(runtime: ToolRuntime, tid: str) -> None:
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            tasks.pop(tid, None)
+            return
+        store_obj.delete(("supervision", _runtime_thread_id(runtime)), tid)
+
     @tool
     def list_tools() -> str:
         """List available tools with short descriptions."""
         return _format_tools(tools)
 
     @tool
-    def start_task(task_id: str, description: str) -> str:
+    def start_task(task_id: str, description: str, runtime: ToolRuntime) -> str:
         """Create or reset a task record in memory."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        existing = tasks.get(tid)
+        existing = _get_task_record(runtime, tid)
         if isinstance(existing, dict) and not existing.get("completed"):
             if not existing.get("description") and (description or "").strip():
                 existing["description"] = (description or "").strip()
+                _put_task_record(runtime, tid, existing)
             return "OK"
-        tasks[tid] = {
-            "task_id": tid,
-            "description": (description or "").strip(),
-            "observations": [],
-            "executor_outputs": [],
-            "judgements": [],
-            "required_skills": [],
-            "optimization_tasks": [],
-            "skill_actions": [],
-            "completed": False,
-        }
+        _put_task_record(
+            runtime,
+            tid,
+            {
+                "task_id": tid,
+                "description": (description or "").strip(),
+                "observations": [],
+                "executor_outputs": [],
+                "judgements": [],
+                "required_skills": [],
+                "optimization_tasks": [],
+                "skill_actions": [],
+                "completed": False,
+            },
+        )
         return "OK"
 
     @tool
-    def add_observation(task_id: str, note: str) -> str:
+    def add_observation(task_id: str, note: str, runtime: ToolRuntime) -> str:
         """Append an observation note to a task record."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         obs = t.get("observations")
         if isinstance(obs, list):
             obs.append((note or "").strip())
+            _put_task_record(runtime, tid, t)
         return "OK"
 
     @tool
-    def record_executor_output(task_id: str, output: str) -> str:
+    def record_executor_output(task_id: str, output: str, runtime: ToolRuntime) -> str:
         """Append executor output to a task record."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         outs = t.get("executor_outputs")
@@ -99,15 +144,16 @@ def build_supervisor_agent(
                     if s in existing:
                         continue
                     req.append({"name": s, "reason": "executor_output:Unknown skill", "ts": now})
+        _put_task_record(runtime, tid, t)
         return "OK"
 
     @tool
-    def add_required_skill(task_id: str, skill_name: str, reason: str = "") -> str:
+    def add_required_skill(task_id: str, skill_name: str, reason: str = "", *, runtime: ToolRuntime) -> str:
         """Record a missing/needed skill for a task."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         n = (skill_name or "").strip()
@@ -120,15 +166,16 @@ def build_supervisor_agent(
         existing = {item.get("name") for item in req if isinstance(item, dict)}
         if n not in existing:
             req.append({"name": n, "reason": (reason or "").strip(), "ts": time.time()})
+            _put_task_record(runtime, tid, t)
         return "OK"
 
     @tool
-    def get_required_skills(task_id: str) -> str:
+    def get_required_skills(task_id: str, runtime: ToolRuntime) -> str:
         """Get required skills list as JSON."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         req = t.get("required_skills")
@@ -200,12 +247,12 @@ def build_supervisor_agent(
         return tasks_out[:5]
 
     @tool
-    def finalize_task(task_id: str, keep_record: bool = False) -> str:
+    def finalize_task(task_id: str, keep_record: bool = False, *, runtime: ToolRuntime) -> str:
         """Snapshot task record, attach optimization tasks, then mark completed and optionally forget."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         if not isinstance(t.get("optimization_tasks"), list) or not t.get("optimization_tasks"):
@@ -221,7 +268,9 @@ def build_supervisor_agent(
         else:
             optimizations_out = []
         if not keep_record:
-            tasks.pop(tid, None)
+            _delete_task_record(runtime, tid)
+        else:
+            _put_task_record(runtime, tid, t)
         return json.dumps(
             {"snapshot": snapshot_path.as_posix(), "optimization_tasks": optimizations_out},
             ensure_ascii=False,
@@ -229,54 +278,56 @@ def build_supervisor_agent(
         )
 
     @tool
-    def add_judgement(task_id: str, judgement: str) -> str:
+    def add_judgement(task_id: str, judgement: str, runtime: ToolRuntime) -> str:
         """Append a judgement item to a task record."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         js = t.get("judgements")
         if isinstance(js, list):
             js.append((judgement or "").strip())
+            _put_task_record(runtime, tid, t)
         return "OK"
 
     @tool
-    def get_task(task_id: str) -> str:
+    def get_task(task_id: str, runtime: ToolRuntime) -> str:
         """Get the current task record as JSON."""
         tid = (task_id or "").strip()
         if not tid:
             return ""
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return ""
         return json.dumps(t, ensure_ascii=False, sort_keys=True)
 
     @tool
-    def mark_completed(task_id: str) -> str:
+    def mark_completed(task_id: str, runtime: ToolRuntime) -> str:
         """Mark a task record as completed."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Task not found."
         t["completed"] = True
+        _put_task_record(runtime, tid, t)
         return "OK"
 
     @tool
-    def forget_task(task_id: str) -> str:
+    def forget_task(task_id: str, runtime: ToolRuntime) -> str:
         """Forget a task record only if completed."""
         tid = (task_id or "").strip()
         if not tid:
             return "Missing task_id."
-        t = tasks.get(tid)
+        t = _get_task_record(runtime, tid)
         if not t:
             return "Not found."
         if not t.get("completed"):
             return "Task not completed."
-        tasks.pop(tid, None)
+        _delete_task_record(runtime, tid)
         return "OK"
 
     tools.extend(
@@ -330,6 +381,9 @@ def build_supervisor_agent(
         model,
         tools=tools,
         system_prompt=system_prompt,
-        middleware=[skill_middleware],
+        middleware=[skill_middleware, memory_middleware],
+        state_schema=UnifiedAgentState,
+        store=store,
+        checkpointer=checkpointer,
     )
     return agent, tools

@@ -5,8 +5,12 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+
+from agents import console_print
+from agents.tools import log_action
 
 from . import skills_state
 from .skills_support import discover_skills_from_dirs
@@ -155,6 +159,72 @@ class SkillManager:
             return 2, "", "Refusing to run outside project root."
         cmd = _shell_command(command)
         try:
+            stream = (os.environ.get("AGENT_STREAM_SUBPROCESS") or "").strip().lower() in {"1", "true", "yes", "on"}
+            if stream:
+                console_print(f"$ {command}", flush=True, ensure_newline=True)
+                process = subprocess.Popen(
+                    cmd,
+                    cwd=self.work_dir,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                output_lines: list[str] = []
+                output_lock = threading.Lock()
+
+                def _reader() -> None:
+                    assert process.stdout is not None
+                    for raw_line in process.stdout:
+                        line = raw_line.rstrip("\n")
+                        console_print(line, flush=True, ensure_newline=True)
+                        with output_lock:
+                            output_lines.append(line)
+
+                t = threading.Thread(target=_reader, daemon=True)
+                t.start()
+                timed_out = False
+                try:
+                    exit_code = process.wait(timeout=timeout_s)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    try:
+                        process.terminate()
+                    except OSError:
+                        pass
+                    try:
+                        exit_code = process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        exit_code = process.wait(timeout=5)
+
+                t.join(timeout=2)
+                try:
+                    if process.stdout is not None:
+                        process.stdout.close()
+                except OSError:
+                    pass
+
+                with output_lock:
+                    out = "\n".join(output_lines)
+                err = ""
+                log_action(
+                    "skills_subprocess",
+                    ok=(exit_code == 0 and not timed_out),
+                    command=command,
+                    cwd=self.work_dir.as_posix(),
+                    exit_code=exit_code,
+                    timeout_s=timeout_s,
+                    stream=True,
+                )
+                if timed_out:
+                    return 124, out, "timeout"
+                return exit_code, out, err
+
             completed = subprocess.run(
                 cmd,
                 cwd=self.work_dir,
@@ -165,9 +235,27 @@ class SkillManager:
                 timeout=timeout_s,
             )
         except FileNotFoundError as e:
+            log_action("skills_subprocess", ok=False, command=command, cwd=self.work_dir.as_posix(), error=str(e))
             return 127, "", str(e)
         except subprocess.TimeoutExpired:
+            log_action(
+                "skills_subprocess",
+                ok=False,
+                command=command,
+                cwd=self.work_dir.as_posix(),
+                exit_code=124,
+                timeout_s=timeout_s,
+                error="timeout",
+            )
             return 124, "", "timeout"
+        log_action(
+            "skills_subprocess",
+            ok=(completed.returncode == 0),
+            command=command,
+            cwd=self.work_dir.as_posix(),
+            exit_code=completed.returncode,
+            stream=False,
+        )
         return completed.returncode, completed.stdout or "", completed.stderr or ""
 
     def install_via_npx(self, package_spec: str, timeout_s: int = 600) -> str:
@@ -227,4 +315,3 @@ class SkillManager:
             shutil.rmtree(target_dir, ignore_errors=False)
             deleted.append(target_dir.as_posix())
         return json.dumps({"deleted": deleted}, ensure_ascii=False, sort_keys=True)
-

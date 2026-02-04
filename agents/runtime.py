@@ -2,17 +2,25 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import os
+import sqlite3
+import time
+import uuid
 from pathlib import Path
 
+from langchain.agents.middleware.types import AgentState
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessageChunk, BaseMessage, BaseMessageChunk, ToolMessage, ToolMessageChunk
 from langchain_deepseek import ChatDeepSeek
+from typing_extensions import TypedDict
 
+from . import console_write
 from skills.skills_support import create_skill_middleware
-from agents.tools import load_mcp_tools_from_config
+from agents.tools import action_log_snapshot, actions_since, action_scope, load_mcp_tools_from_config
+from memory import create_memory_middleware
 
 
 _TOKEN_USAGE: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+_ESTIMATED_TOKEN_USAGE: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
 def reset_token_usage() -> None:
@@ -21,8 +29,26 @@ def reset_token_usage() -> None:
     _TOKEN_USAGE["total_tokens"] = 0
 
 
+def reset_estimated_token_usage() -> None:
+    _ESTIMATED_TOKEN_USAGE["input_tokens"] = 0
+    _ESTIMATED_TOKEN_USAGE["output_tokens"] = 0
+    _ESTIMATED_TOKEN_USAGE["total_tokens"] = 0
+
+
 def get_token_usage() -> dict[str, int]:
     return dict(_TOKEN_USAGE)
+
+
+def get_estimated_token_usage() -> dict[str, int]:
+    return dict(_ESTIMATED_TOKEN_USAGE)
+
+
+def add_estimated_token_usage(usage: dict[str, int]) -> None:
+    if not isinstance(usage, dict):
+        return
+    _ESTIMATED_TOKEN_USAGE["input_tokens"] += int(usage.get("input_tokens") or 0)
+    _ESTIMATED_TOKEN_USAGE["output_tokens"] += int(usage.get("output_tokens") or 0)
+    _ESTIMATED_TOKEN_USAGE["total_tokens"] += int(usage.get("total_tokens") or 0)
 
 
 def _normalize_token_usage(data: object) -> dict[str, int] | None:
@@ -162,7 +188,38 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
                 text = item.get("text")
                 if isinstance(text, str) and text:
                     parts.append(text)
-        return "".join(parts)
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        kept_rev: list[str] = []
+        for s in reversed(parts):
+            if any(k.startswith(s) for k in kept_rev):
+                continue
+            kept_rev.append(s)
+        kept = list(reversed(kept_rev))
+
+        assembled = ""
+        for s in kept:
+            if not assembled:
+                assembled = s
+                continue
+            if s.startswith(assembled):
+                assembled = s
+                continue
+            if assembled.endswith(s):
+                continue
+            max_k = min(len(assembled), len(s))
+            k_found = 0
+            for k in range(max_k, 0, -1):
+                if assembled.endswith(s[:k]):
+                    k_found = k
+                    break
+            if k_found:
+                assembled += s[k_found:]
+            else:
+                assembled += s
+        return assembled
     return str(content)
 
 
@@ -187,6 +244,224 @@ def _summarize_tool_output_for_terminal(raw: str) -> str:
     return "\n".join(lines)
 
 
+def _format_actions_for_console(actions: list[dict[str, object]]) -> str:
+    lines: list[str] = []
+    for a in actions:
+        kind = a.get("kind")
+        ok = a.get("ok")
+        if kind == "write_file":
+            lines.append(f"- write_file ok={ok} path={a.get('path')} size={a.get('size')}")
+        elif kind == "write_project_file":
+            lines.append(f"- write_project_file ok={ok} path={a.get('path')} size={a.get('size')}")
+        elif kind == "read_file":
+            lines.append(f"- read_file ok={ok} path={a.get('path')} truncated={a.get('truncated')}")
+        elif kind == "list_dir":
+            lines.append(f"- list_dir ok={ok} path={a.get('path')} recursive={a.get('recursive')} entries={a.get('entries')}")
+        elif kind == "delete_path":
+            lines.append(f"- delete_path ok={ok} path={a.get('path')} recursive={a.get('recursive')}")
+        elif kind == "run_cli":
+            lines.append(
+                f"- run_cli ok={ok} exit_code={a.get('exit_code')} cwd={a.get('cwd')} cmd={a.get('command')}"
+            )
+        elif kind == "skills_subprocess":
+            lines.append(
+                f"- skills_subprocess ok={ok} exit_code={a.get('exit_code')} cwd={a.get('cwd')} cmd={a.get('command')}"
+            )
+        else:
+            lines.append(f"- {a}")
+    return "\n".join(lines)
+
+
+def _summarize_actions_for_console(actions: list[dict[str, object]]) -> str:
+    if not actions:
+        return ""
+    counts: dict[str, int] = {}
+    for a in actions:
+        kind = a.get("kind")
+        if not isinstance(kind, str) or not kind:
+            kind = "unknown"
+        counts[kind] = counts.get(kind, 0) + 1
+    parts = [f"{k} x{v}" for k, v in sorted(counts.items())]
+    return "，".join(parts)
+
+
+def _diff_token_usage(after: dict[str, int], before: dict[str, int]) -> dict[str, int]:
+    return {
+        "input_tokens": max(0, int(after.get("input_tokens") or 0) - int(before.get("input_tokens") or 0)),
+        "output_tokens": max(0, int(after.get("output_tokens") or 0) - int(before.get("output_tokens") or 0)),
+        "total_tokens": max(0, int(after.get("total_tokens") or 0) - int(before.get("total_tokens") or 0)),
+    }
+
+
+def _is_tool_calls_sequence_error(e: Exception) -> bool:
+    msg = str(e or "")
+    if not msg:
+        return False
+    if "tool_calls" not in msg:
+        return False
+    if "must be followed by tool messages" in msg:
+        return True
+    if "insufficient tool messages" in msg:
+        return True
+    if "tool_call_id" in msg and "followed by tool messages" in msg:
+        return True
+    return False
+
+
+def _stream_text_delta(new_text: str, *, last_seen: str | None, assembled: str) -> tuple[str, str | None]:
+    def _strip_overlap(prev: str, delta: str) -> str:
+        if not prev or not delta:
+            return delta
+        max_k = min(len(prev), len(delta))
+        for k in range(max_k, 0, -1):
+            if prev.endswith(delta[:k]):
+                return delta[k:]
+        return delta
+
+    t = new_text or ""
+    if not t:
+        return "", last_seen
+    if last_seen is not None and t == last_seen:
+        return "", last_seen
+    if assembled and t.startswith(assembled):
+        delta = t[len(assembled) :]
+        return _strip_overlap(assembled, delta), t
+    if last_seen and t.startswith(last_seen):
+        delta = t[len(last_seen) :]
+        return _strip_overlap(assembled, delta), t
+    if last_seen and last_seen.startswith(t):
+        return "", last_seen
+    if assembled and assembled.endswith(t):
+        return "", t
+    if assembled:
+        max_k = min(len(assembled), len(t))
+        for k in range(max_k, 0, -1):
+            if assembled.endswith(t[:k]):
+                return _strip_overlap(assembled, t[k:]), t
+    return _strip_overlap(assembled, t), t
+
+
+
+def stream_nested_agent_reply(agent, messages: list[dict[str, str]], *, label: str, thread_id: str | None = None) -> tuple[str, str]:
+    snapshot = action_log_snapshot()
+    last_action_index = 0
+    usage_before = get_token_usage()
+
+    console_write(f"\n[{label}] 开始\n", flush=True)
+
+    def _write_out(s: str) -> None:
+        if not s:
+            return
+        console_write(s, flush=True)
+
+    def _drain_actions() -> None:
+        nonlocal last_action_index
+        actions = actions_since(snapshot, scope=label)
+        if len(actions) <= last_action_index:
+            return
+        delta = actions[last_action_index:]
+        last_action_index = len(actions)
+        if not delta:
+            return
+        summary = _summarize_actions_for_console(delta)
+        if summary:
+            _write_out(f"\n[{label}] {summary}\n")
+        _write_out(f"{_format_actions_for_console(delta)}\n")
+
+    active_thread_id = thread_id
+    reply = ""
+    tool_output = ""
+    with action_scope(label):
+        for attempt in range(2):
+            chunks: list[str] = []
+            tool_chunks: list[str] = []
+            assistant_buf = ""
+            last_flush_t = time.monotonic()
+            last_assistant_seen: str | None = None
+            last_tool_seen: str | None = None
+            assistant_assembled = ""
+            tool_assembled = ""
+
+            def _flush_assistant(force: bool = False) -> None:
+                nonlocal assistant_buf, last_flush_t
+                if not assistant_buf:
+                    return
+                now = time.monotonic()
+                if force or "\n" in assistant_buf or len(assistant_buf) >= 256 or (now - last_flush_t) >= 0.03:
+                    _write_out(assistant_buf)
+                    assistant_buf = ""
+                    last_flush_t = now
+
+            try:
+                for event in agent.stream(
+                    {"messages": messages},
+                    stream_mode="messages",
+                    config=_agent_stream_config(checkpoint_ns=label, thread_id=active_thread_id),
+                ):
+                    if isinstance(event, tuple) and event:
+                        msg = event[0]
+                    else:
+                        msg = event
+                    if isinstance(msg, AIMessageChunk):
+                        capture_token_usage_from_message(msg)
+                        text = _extract_text(msg)
+                        delta, last_assistant_seen = _stream_text_delta(
+                            text, last_seen=last_assistant_seen, assembled=assistant_assembled
+                        )
+                        if delta:
+                            assistant_assembled += delta
+                            assistant_buf += delta
+                            _flush_assistant(force=False)
+                            chunks.append(delta)
+                        _drain_actions()
+                    elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
+                        text = _extract_text(msg)
+                        delta, last_tool_seen = _stream_text_delta(
+                            text, last_seen=last_tool_seen, assembled=tool_assembled
+                        )
+                        if delta:
+                            tool_assembled += delta
+                            tool_chunks.append(delta)
+                            summarized = _summarize_tool_output_for_terminal(delta)
+                            if summarized:
+                                _write_out(f"\n[{label}] {summarized}\n")
+                        _drain_actions()
+                _flush_assistant(force=True)
+                reply = assistant_assembled
+                tool_output = tool_assembled
+                break
+            except Exception as e:
+                if attempt == 0 and _is_tool_calls_sequence_error(e):
+                    _flush_assistant(force=True)
+                    _write_out(f"\n[{label}] 检测到 tool_calls 断链，重置线程并重试\n")
+                    _drain_actions()
+                    active_thread_id = uuid.uuid4().hex[:12]
+                    continue
+                _flush_assistant(force=True)
+                _write_out(f"\n[{label}] 发生错误：{type(e).__name__}: {e}\n")
+                _drain_actions()
+                break
+
+    _drain_actions()
+
+    usage_after = get_token_usage()
+    delta = _diff_token_usage(usage_after, usage_before)
+    if delta.get("total_tokens", 0) <= 0:
+        prompt_text = "\n".join(str(m.get("content") or "") for m in messages)
+        est = estimate_token_usage(prompt_text, reply)
+        add_estimated_token_usage(est)
+        _write_out(
+            f"\n[{label}] tokens(估算): input={est.get('input_tokens', 0)} output={est.get('output_tokens', 0)} total={est.get('total_tokens', 0)}\n"
+        )
+    else:
+        _write_out(
+            f"\n[{label}] tokens: input={delta.get('input_tokens', 0)} output={delta.get('output_tokens', 0)} total={delta.get('total_tokens', 0)}\n"
+        )
+
+    console_write(f"[{label}] 结束\n\n", flush=True)
+    return reply, tool_output
+
+
 def _recursion_limit() -> int:
     raw = (os.environ.get("AGENT_RECURSION_LIMIT") or "").strip()
     if not raw:
@@ -198,41 +473,86 @@ def _recursion_limit() -> int:
     return max(10, min(500, v))
 
 
-def _run_agent_to_text(agent, messages: list[dict[str, str]]) -> tuple[str, str]:
-    chunks: list[str] = []
-    tool_chunks: list[str] = []
+def _run_agent_to_text(
+    agent,
+    messages: list[dict[str, str]],
+    *,
+    checkpoint_ns: str = "observer",
+    thread_id: str | None = None,
+) -> tuple[str, str]:
     try:
         from langgraph.errors import GraphRecursionError
     except Exception:
         GraphRecursionError = None
 
-    try:
-        for event in agent.stream(
-            {"messages": messages},
-            stream_mode="messages",
-            config={"recursion_limit": _recursion_limit()},
-        ):
-            if isinstance(event, tuple) and event:
-                msg = event[0]
-            else:
-                msg = event
-            if isinstance(msg, AIMessageChunk):
-                capture_token_usage_from_message(msg)
-                text = _extract_text(msg)
-                if text:
-                    chunks.append(text)
-            elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
-                text = _extract_text(msg)
-                if text:
-                    tool_chunks.append(text)
-    except Exception as e:
-        if GraphRecursionError is not None and isinstance(e, GraphRecursionError):
-            chunks.append(
-                f"\n\n[错误] 模型工具调用步数达到上限（recursion_limit={_recursion_limit()}），可能陷入循环。"
-            )
-        else:
-            chunks.append(f"\n\n[错误] agent 运行失败：{type(e).__name__}: {e}")
-    return "".join(chunks), "".join(tool_chunks)
+    active_thread_id = thread_id
+    reply = ""
+    tool_output = ""
+    with action_scope(checkpoint_ns):
+        for attempt in range(2):
+            assistant_assembled = ""
+            tool_assembled = ""
+            last_assistant_seen: str | None = None
+            last_tool_seen: str | None = None
+            try:
+                for event in agent.stream(
+                    {"messages": messages},
+                    stream_mode="messages",
+                    config=_agent_stream_config(checkpoint_ns=checkpoint_ns, thread_id=active_thread_id),
+                ):
+                    if isinstance(event, tuple) and event:
+                        msg = event[0]
+                    else:
+                        msg = event
+                    if isinstance(msg, AIMessageChunk):
+                        capture_token_usage_from_message(msg)
+                        text = _extract_text(msg)
+                        delta, last_assistant_seen = _stream_text_delta(
+                            text, last_seen=last_assistant_seen, assembled=assistant_assembled
+                        )
+                        if delta:
+                            assistant_assembled += delta
+                    elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
+                        text = _extract_text(msg)
+                        delta, last_tool_seen = _stream_text_delta(
+                            text, last_seen=last_tool_seen, assembled=tool_assembled
+                        )
+                        if delta:
+                            tool_assembled += delta
+                reply = assistant_assembled
+                tool_output = tool_assembled
+                break
+            except Exception as e:
+                if attempt == 0 and _is_tool_calls_sequence_error(e):
+                    active_thread_id = uuid.uuid4().hex[:12]
+                    continue
+                if GraphRecursionError is not None and isinstance(e, GraphRecursionError):
+                    reply = f"\n\n[错误] 模型工具调用步数达到上限（recursion_limit={_recursion_limit()}），可能陷入循环。"
+                else:
+                    reply = f"\n\n[错误] agent 运行失败：{type(e).__name__}: {e}"
+                break
+    return reply, tool_output
+
+
+def _ensure_thread_id() -> str:
+    tid = (os.environ.get("AGENT_THREAD_ID") or "").strip()
+    if tid:
+        return tid
+    tid = uuid.uuid4().hex[:12]
+    os.environ["AGENT_THREAD_ID"] = tid
+    return tid
+
+
+def _agent_stream_config(*, checkpoint_ns: str, thread_id: str | None = None) -> dict[str, object]:
+    tid = (thread_id or "").strip() or _ensure_thread_id()
+    return {
+        "recursion_limit": _recursion_limit(),
+        "configurable": {"thread_id": tid, "checkpoint_ns": (checkpoint_ns or "").strip()},
+    }
+
+
+class UnifiedAgentState(AgentState[object], total=False):
+    shared: dict[str, object]
 
 
 def _tool_name(t: object) -> str:
@@ -290,7 +610,31 @@ def build_agent(
 ) -> tuple[object, str, int]:
     skill_catalog_text, skill_middleware = create_skill_middleware(skills_dirs)
     skill_count = count_skills_in_catalog_text(skill_catalog_text)
+    memory_middleware = create_memory_middleware(project_root)
     mcp_tools = load_mcp_tools_from_config()
+    agents_dir = (project_root / ".agents").resolve()
+    agents_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        from langgraph.store.sqlite import SqliteStore
+
+        store_conn = sqlite3.connect(str((agents_dir / "store.sqlite").resolve()), check_same_thread=False)
+        store = SqliteStore(store_conn)
+        store.setup()
+    except Exception:
+        from langgraph.store.memory import InMemoryStore
+
+        store = InMemoryStore()
+
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+
+        checkpoint_conn = sqlite3.connect(str((agents_dir / "checkpoints.sqlite").resolve()), check_same_thread=False)
+        checkpointer = SqliteSaver(checkpoint_conn)
+    except Exception:
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        checkpointer = InMemorySaver()
 
     from .executor_agent import build_executor_agent, executor_tools
     from .observer_agent import build_observer_agent
@@ -302,7 +646,10 @@ def build_agent(
         work_dir=work_dir,
         model_name=model_name,
         skill_middleware=skill_middleware,
+        memory_middleware=memory_middleware,
         mcp_tools=mcp_tools,
+        store=store,
+        checkpointer=checkpointer,
     )
 
     executor_tools_list = executor_tools(mcp_tools=mcp_tools, skill_middleware=skill_middleware)
@@ -310,10 +657,13 @@ def build_agent(
     supervisor_agent, supervisor_tools = build_supervisor_agent(
         model_name=model_name,
         skill_middleware=skill_middleware,
+        memory_middleware=memory_middleware,
         skills_dirs=skills_dirs,
         project_root=project_root,
         output_dir=output_dir,
         work_dir=work_dir,
+        store=store,
+        checkpointer=checkpointer,
     )
 
     observer_agent = build_observer_agent(
@@ -322,10 +672,13 @@ def build_agent(
         work_dir=work_dir,
         model_name=model_name,
         skill_middleware=skill_middleware,
+        memory_middleware=memory_middleware,
         executor_agent=executor_agent,
         executor_tools=executor_tools_list,
         supervisor_agent=supervisor_agent,
         supervisor_tools=supervisor_tools,
+        store=store,
+        checkpointer=checkpointer,
     )
 
     return observer_agent, skill_catalog_text, skill_count

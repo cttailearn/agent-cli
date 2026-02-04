@@ -8,6 +8,8 @@ from langchain_core.tools import tool
 from skills.skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
 from agents.tools import (
     Bash,
+    Exec,
+    Process,
     Read,
     Write,
     delete_path,
@@ -17,6 +19,7 @@ from agents.tools import (
     list_dir,
     memory_core_append,
     memory_core_write,
+    memory_episodic_append,
     memory_user_write,
     read_file,
     run_cli,
@@ -26,7 +29,7 @@ from agents.tools import (
 
 from memory import load_core_prompt
 
-from .runtime import _format_tools, _init_model
+from .runtime import UnifiedAgentState, _format_tools, _init_model
 
 
 def build_executor_agent(
@@ -36,7 +39,10 @@ def build_executor_agent(
     work_dir: Path,
     model_name: str,
     skill_middleware: SkillMiddleware,
+    memory_middleware,
     mcp_tools: list[object],
+    store,
+    checkpointer,
 ):
     model = _init_model(model_name)
 
@@ -74,7 +80,10 @@ def build_executor_agent(
         model,
         tools=tools,
         system_prompt=system_prompt,
-        middleware=[skill_middleware],
+        middleware=[skill_middleware, memory_middleware],
+        state_schema=UnifiedAgentState,
+        store=store,
+        checkpointer=checkpointer,
     )
 
 
@@ -85,6 +94,8 @@ def executor_tools(*, mcp_tools: list[object], skill_middleware: SkillMiddleware
         edit_file,
         glob_paths,
         grep,
+        Exec,
+        Process,
         Bash,
         write_file,
         read_file,
@@ -94,6 +105,7 @@ def executor_tools(*, mcp_tools: list[object], skill_middleware: SkillMiddleware
         run_cli,
         memory_core_append,
         memory_core_write,
+        memory_episodic_append,
         memory_user_write,
         *mcp_tools,
         *skill_middleware.tools,

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import os
 import re
-import sys
 import time
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,8 +15,17 @@ from langchain_core.messages import (
     ToolMessageChunk,
 )
 
-from agents.runtime import capture_token_usage_from_message, estimate_token_usage, get_token_usage, reset_token_usage
-from agents.tools import action_log_snapshot, actions_since, delete_path, list_dir, read_file, run_cli
+from agents import console_write
+from agents.runtime import (
+    capture_token_usage_from_message,
+    estimate_token_usage,
+    get_estimated_token_usage,
+    get_token_usage,
+    reset_estimated_token_usage,
+    reset_token_usage,
+    _stream_text_delta,
+)
+from agents.tools import action_log_snapshot, actions_since, action_scope, delete_path, list_dir, read_file, run_cli
 
 
 _COMPLETION_CLAIM_RE = re.compile(
@@ -89,7 +98,38 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
                 text = item.get("text")
                 if isinstance(text, str) and text:
                     parts.append(text)
-        return "".join(parts)
+        if not parts:
+            return ""
+        if len(parts) == 1:
+            return parts[0]
+        kept_rev: list[str] = []
+        for s in reversed(parts):
+            if any(k.startswith(s) for k in kept_rev):
+                continue
+            kept_rev.append(s)
+        kept = list(reversed(kept_rev))
+
+        assembled = ""
+        for s in kept:
+            if not assembled:
+                assembled = s
+                continue
+            if s.startswith(assembled):
+                assembled = s
+                continue
+            if assembled.endswith(s):
+                continue
+            max_k = min(len(assembled), len(s))
+            k_found = 0
+            for k in range(max_k, 0, -1):
+                if assembled.endswith(s[:k]):
+                    k_found = k
+                    break
+            if k_found:
+                assembled += s[k_found:]
+            else:
+                assembled += s
+        return assembled
     return str(content)
 
 
@@ -175,8 +215,12 @@ def _print_last(state: CliState, kind: str) -> None:
 
 
 def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliState) -> str:
+    label = "observer"
+    stream_delegation = (os.environ.get("AGENT_STREAM_DELEGATION") or "").strip().lower() in {"1", "true", "yes", "on"}
+    drain_scope = label if stream_delegation else None
     snapshot = action_log_snapshot()
     reset_token_usage()
+    reset_estimated_token_usage()
     chunks: list[str] = []
     tool_chunks: list[str] = []
     has_tool_output = False
@@ -186,15 +230,17 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
     last_flush_t = time.monotonic()
     tool_stream_buf = ""
     last_action_index = 0
+    last_assistant_seen: str | None = None
+    last_tool_seen: str | None = None
+    assistant_assembled = ""
+    tool_assembled = ""
 
     def _write_out(s: str, flush: bool = False) -> None:
         nonlocal last_output_newline
         if not s:
             return
-        sys.stdout.write(s)
+        console_write(s, flush=flush)
         last_output_newline = s.endswith("\n")
-        if flush:
-            sys.stdout.flush()
 
     def _flush_assistant(force: bool = False) -> None:
         nonlocal assistant_buf, last_flush_t
@@ -225,7 +271,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
 
     def _drain_actions() -> None:
         nonlocal last_action_index
-        actions = actions_since(snapshot)
+        actions = actions_since(snapshot, scope=drain_scope) if drain_scope else actions_since(snapshot)
         if len(actions) <= last_action_index:
             return
         delta = actions[last_action_index:]
@@ -255,43 +301,56 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
         GraphRecursionError = None
 
     try:
-        for event in agent.stream(
-            {"messages": messages},
-            stream_mode="messages",
-            config={"recursion_limit": _recursion_limit()},
-        ):
-            if isinstance(event, tuple) and event:
-                msg = event[0]
-            else:
-                msg = event
-            if isinstance(msg, AIMessageChunk):
-                capture_token_usage_from_message(msg)
-                text = _extract_text(msg)
-                if text:
-                    _switch_to_assistant()
-                    assistant_buf += text
-                    _flush_assistant(force=False)
-                    chunks.append(text)
-                _drain_actions()
-            elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
-                text = _extract_text(msg)
-                if text:
-                    tool_chunks.append(text)
-                    has_tool_output = True
-                    if state.show_tool_output:
-                        _switch_to_tools()
-                        tool_stream_buf += text
-                        while "\n" in tool_stream_buf:
-                            line, tool_stream_buf = tool_stream_buf.split("\n", 1)
-                            s = line.strip()
-                            if (
-                                s.startswith("path: ")
-                                or s.startswith("Wrote file: ")
-                                or s.startswith("Edited: ")
-                                or s.startswith("Deleted: ")
-                            ):
-                                _write_out(f"{s}\n", flush=True)
-                _drain_actions()
+        with action_scope(label):
+            for event in agent.stream(
+                {"messages": messages},
+                stream_mode="messages",
+                config={
+                    "recursion_limit": _recursion_limit(),
+                    "configurable": {
+                        "thread_id": (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default",
+                        "checkpoint_ns": "observer",
+                    },
+                },
+            ):
+                if isinstance(event, tuple) and event:
+                    msg = event[0]
+                else:
+                    msg = event
+                if isinstance(msg, AIMessageChunk):
+                    capture_token_usage_from_message(msg)
+                    text = _extract_text(msg)
+                    delta, last_assistant_seen = _stream_text_delta(
+                        text, last_seen=last_assistant_seen, assembled=assistant_assembled
+                    )
+                    if delta:
+                        assistant_assembled += delta
+                        _switch_to_assistant()
+                        assistant_buf += delta
+                        _flush_assistant(force=False)
+                        chunks.append(delta)
+                    _drain_actions()
+                elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
+                    text = _extract_text(msg)
+                    delta, last_tool_seen = _stream_text_delta(text, last_seen=last_tool_seen, assembled=tool_assembled)
+                    if delta:
+                        tool_assembled += delta
+                        tool_chunks.append(delta)
+                        has_tool_output = True
+                        if state.show_tool_output:
+                            _switch_to_tools()
+                            tool_stream_buf += delta
+                            while "\n" in tool_stream_buf:
+                                line, tool_stream_buf = tool_stream_buf.split("\n", 1)
+                                s = line.strip()
+                                if (
+                                    s.startswith("path: ")
+                                    or s.startswith("Wrote file: ")
+                                    or s.startswith("Edited: ")
+                                    or s.startswith("Deleted: ")
+                                ):
+                                    _write_out(f"{s}\n", flush=True)
+                    _drain_actions()
     except Exception as e:
         _flush_assistant(force=True)
         if not last_output_newline:
@@ -313,7 +372,16 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
         prompt_text = "\n".join(str(m.get("content") or "") for m in messages)
         state.last_token_usage = estimate_token_usage(prompt_text, reply)
         state.last_token_usage_is_estimate = True
-    actions = actions_since(snapshot)
+
+    extra = get_estimated_token_usage()
+    if extra.get("total_tokens", 0) > 0 and state.last_token_usage is not None:
+        state.last_token_usage = {
+            "input_tokens": int(state.last_token_usage.get("input_tokens") or 0) + int(extra.get("input_tokens") or 0),
+            "output_tokens": int(state.last_token_usage.get("output_tokens") or 0) + int(extra.get("output_tokens") or 0),
+            "total_tokens": int(state.last_token_usage.get("total_tokens") or 0) + int(extra.get("total_tokens") or 0),
+        }
+        state.last_token_usage_is_estimate = True
+    actions = actions_since(snapshot, scope=drain_scope) if drain_scope else actions_since(snapshot)
 
     state.last_actions = actions
     raw_tool_output = "".join(tool_chunks)
@@ -362,6 +430,7 @@ def handle_local_command(
     if cmd in {"reset", "r"}:
         messages.clear()
         history.clear()
+        os.environ["AGENT_THREAD_ID"] = uuid.uuid4().hex[:12]
         print("已重置对话与历史。")
         return "continue"
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import uuid
 from pathlib import Path
 
+from langgraph.prebuilt import ToolRuntime
 from langchain.agents import create_agent
 from langchain_core.tools import tool
 
@@ -11,8 +13,16 @@ from skills.skills_support import BASE_SYSTEM_PROMPT, SkillMiddleware
 from memory import load_core_prompt
 
 from agents.tools import memory_core_read, memory_kg_recall, memory_kg_stats, memory_user_read
+from . import console_print
 
-from .runtime import _format_tools, _init_model, _run_agent_to_text, _summarize_tool_output_for_terminal
+from .runtime import (
+    UnifiedAgentState,
+    _format_tools,
+    _init_model,
+    _run_agent_to_text,
+    _summarize_tool_output_for_terminal,
+    stream_nested_agent_reply,
+)
 
 
 def build_observer_agent(
@@ -22,16 +32,50 @@ def build_observer_agent(
     work_dir: Path,
     model_name: str,
     skill_middleware: SkillMiddleware,
+    memory_middleware,
     executor_agent,
     executor_tools: list[object],
     supervisor_agent,
     supervisor_tools: list[object],
+    store,
+    checkpointer,
 ):
     model = _init_model(model_name)
     memory: dict[str, str] = {}
+    shared_context: dict[str, str] = {}
     last_supervision_task_id: str = ""
 
     tools: list[object] = []
+
+    def _runtime_thread_id(runtime: ToolRuntime) -> str:
+        cfg = getattr(runtime, "config", None) or {}
+        if isinstance(cfg, dict):
+            configurable = cfg.get("configurable") or {}
+            if isinstance(configurable, dict):
+                tid = (configurable.get("thread_id") or "").strip()
+                if tid:
+                    return tid
+        return "default"
+
+    def _state_shared_context(runtime: ToolRuntime) -> dict[str, str] | None:
+        st = getattr(runtime, "state", None)
+        if not isinstance(st, dict):
+            return None
+        shared = st.get("shared")
+        if not isinstance(shared, dict):
+            shared = {}
+            st["shared"] = shared
+        ctx = shared.get("context")
+        if isinstance(ctx, dict):
+            out: dict[str, str] = {}
+            for k, v in ctx.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    out[k] = v
+            shared["context"] = out
+            return out
+        out = {}
+        shared["context"] = out
+        return out
 
     @tool
     def list_tools() -> str:
@@ -49,29 +93,106 @@ def build_observer_agent(
         return _format_tools(supervisor_tools)
 
     @tool
-    def remember(key: str, value: str) -> str:
+    def remember(key: str, value: str, runtime: ToolRuntime) -> str:
         """Store a memory item for the current session."""
         k = (key or "").strip()
         if not k:
             return "Missing key."
-        memory[k] = (value or "").strip()
+        v = (value or "").strip()
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            memory[k] = v
+            return "OK"
+        store_obj.put(("sessions", _runtime_thread_id(runtime)), k, {"value": v})
         return "OK"
 
     @tool
-    def recall(key: str) -> str:
+    def recall(key: str, runtime: ToolRuntime) -> str:
         """Recall a memory item for the current session."""
         k = (key or "").strip()
         if not k:
             return "Missing key."
-        return memory.get(k, "")
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            return memory.get(k, "")
+        item = store_obj.get(("sessions", _runtime_thread_id(runtime)), k)
+        if item is None:
+            return ""
+        val = getattr(item, "value", None)
+        if isinstance(val, dict):
+            v = val.get("value")
+            return v if isinstance(v, str) else ""
+        return ""
 
     @tool
-    def forget(key: str) -> str:
+    def forget(key: str, runtime: ToolRuntime) -> str:
         """Delete a memory item for the current session."""
         k = (key or "").strip()
         if not k:
             return "Missing key."
-        return "OK" if memory.pop(k, None) is not None else "Not found."
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            return "OK" if memory.pop(k, None) is not None else "Not found."
+        store_obj.delete(("sessions", _runtime_thread_id(runtime)), k)
+        return "OK"
+
+    @tool
+    def shared_context_put(key: str, value: str, runtime: ToolRuntime) -> str:
+        """Store a key/value into shared context for the current session/thread."""
+        k = (key or "").strip()
+        if not k:
+            return "Missing key."
+        v = (value or "").strip()
+        ctx = _state_shared_context(runtime)
+        if ctx is not None:
+            ctx[k] = v
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            shared_context[k] = v
+            return "OK"
+        store_obj.put(("shared_context", _runtime_thread_id(runtime)), k, {"value": v})
+        return "OK"
+
+    @tool
+    def shared_context_get(key: str, runtime: ToolRuntime) -> str:
+        """Get a value from shared context for the current session/thread."""
+        k = (key or "").strip()
+        if not k:
+            return "Missing key."
+        ctx = _state_shared_context(runtime)
+        if ctx is not None and k in ctx:
+            return ctx.get(k, "")
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            return shared_context.get(k, "")
+        item = store_obj.get(("shared_context", _runtime_thread_id(runtime)), k)
+        if item is None:
+            return ""
+        val = getattr(item, "value", None)
+        if isinstance(val, dict):
+            v = val.get("value")
+            out = v if isinstance(v, str) else ""
+        else:
+            out = val if isinstance(val, str) else ""
+        if ctx is not None and out:
+            ctx[k] = out
+        return out
+
+    @tool
+    def shared_context_forget(key: str, runtime: ToolRuntime) -> str:
+        """Delete a key from shared context for the current session/thread."""
+        k = (key or "").strip()
+        if not k:
+            return "Missing key."
+        ctx = _state_shared_context(runtime)
+        if ctx is not None:
+            ctx.pop(k, None)
+        store_obj = getattr(runtime, "store", None)
+        if store_obj is None:
+            shared_context.pop(k, None)
+            return "OK"
+        store_obj.delete(("shared_context", _runtime_thread_id(runtime)), k)
+        return "OK"
 
     def _is_complex_task(task_text: str) -> bool:
         t = (task_text or "").strip()
@@ -101,11 +222,30 @@ def build_observer_agent(
         task_text = (task or "").strip()
         if not task_text:
             return "Empty task."
-        answer, tool_output = _run_agent_to_text(executor_agent, [{"role": "user", "content": task_text}])
+        tid = last_supervision_task_id
+        if not tid and _is_complex_task(task_text):
+            tid = start_supervision(task_text)
+        call_thread_id = uuid.uuid4().hex[:12]
+        stream = (os.environ.get("AGENT_STREAM_DELEGATION") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if stream:
+            console_print(f"\n[observer -> executor]\n{task_text}\n", flush=True)
+            answer, tool_output = stream_nested_agent_reply(
+                executor_agent, [{"role": "user", "content": task_text}], label="executor", thread_id=call_thread_id
+            )
+        else:
+            answer, tool_output = _run_agent_to_text(
+                executor_agent,
+                [{"role": "user", "content": task_text}],
+                checkpoint_ns="executor",
+                thread_id=call_thread_id,
+            )
         summarized = _summarize_tool_output_for_terminal(tool_output)
-        if summarized:
-            return f"{summarized}\n{answer}"
-        return answer
+        out = f"{summarized}\n{answer}" if summarized else answer
+        if tid:
+            judgement = supervised_check(tid, out)
+            if judgement:
+                out = f"{out}\n\n{judgement}"
+        return out
 
     @tool
     def delegate_to_supervisor(task: str) -> str:
@@ -113,7 +253,23 @@ def build_observer_agent(
         task_text = (task or "").strip()
         if not task_text:
             return "Empty task."
-        answer, tool_output = _run_agent_to_text(supervisor_agent, [{"role": "user", "content": task_text}])
+        supervisor_thread_id = _supervision_thread_id()
+        stream = (os.environ.get("AGENT_STREAM_DELEGATION") or "").strip().lower() in {"1", "true", "yes", "on"}
+        if stream:
+            console_print(f"\n[observer -> supervisor]\n{task_text}\n", flush=True)
+            answer, tool_output = stream_nested_agent_reply(
+                supervisor_agent,
+                [{"role": "user", "content": task_text}],
+                label="supervisor",
+                thread_id=supervisor_thread_id,
+            )
+        else:
+            answer, tool_output = _run_agent_to_text(
+                supervisor_agent,
+                [{"role": "user", "content": task_text}],
+                checkpoint_ns="supervisor",
+                thread_id=supervisor_thread_id,
+            )
         summarized = _summarize_tool_output_for_terminal(tool_output)
         if summarized:
             return f"{summarized}\n{answer}"
@@ -141,6 +297,23 @@ def build_observer_agent(
         )
 
     @tool
+    def append_episodic_memory(content: str) -> str:
+        """Delegate to executor to append one entry into episodic fragmented memory markdown."""
+        text = (content or "").strip()
+        if not text:
+            return "Empty content."
+        return delegate_to_executor(
+            "\n".join(
+                [
+                    "请将以下内容写入项目长期分片记忆（episodic）Markdown（追加一条）。",
+                    "要求：只调用一次 memory_episodic_append(content)，并返回调用结果。",
+                    "content:",
+                    text,
+                ]
+            )
+        )
+
+    @tool
     def write_core_memory(kind: str, content: str) -> str:
         """Delegate to executor to overwrite core memory markdown."""
         k = (kind or "").strip()
@@ -158,6 +331,13 @@ def build_observer_agent(
                 ]
             )
         )
+
+    def _supervision_thread_id() -> str:
+        base = (os.environ.get("AGENT_THREAD_ID") or "").strip()
+        if not base:
+            base = uuid.uuid4().hex[:12]
+            os.environ["AGENT_THREAD_ID"] = base
+        return f"{base}-supervisor"
 
     @tool
     def start_supervision(task: str) -> str:
@@ -186,6 +366,8 @@ def build_observer_agent(
                     ),
                 }
             ],
+            checkpoint_ns="supervisor",
+            thread_id=_supervision_thread_id(),
         )
         return task_id
 
@@ -216,6 +398,8 @@ def build_observer_agent(
                     ),
                 }
             ],
+            checkpoint_ns="supervisor",
+            thread_id=_supervision_thread_id(),
         )
         summarized = _summarize_tool_output_for_terminal(tool_output)
         if summarized:
@@ -231,18 +415,6 @@ def build_observer_agent(
             tid = last_supervision_task_id
         if not tid:
             return ""
-        finalize = None
-        for t in supervisor_tools:
-            if getattr(t, "name", "") == "finalize_task":
-                finalize = t
-                break
-        if finalize is not None and hasattr(finalize, "invoke"):
-            try:
-                result = finalize.invoke({"task_id": tid, "keep_record": False})
-                last_supervision_task_id = ""
-                return str(result or "")
-            except Exception:
-                pass
         answer, tool_output = _run_agent_to_text(
             supervisor_agent,
             [
@@ -250,13 +422,15 @@ def build_observer_agent(
                     "role": "user",
                     "content": "\n".join(
                         [
-                            "请在确认任务已完成后，标记任务完成并清理任务记忆。",
+                            "请在确认任务已完成后，生成任务快照并清理任务记忆。",
                             f"task_id={tid}",
-                            "要求：先调用 mark_completed(task_id)，再调用 forget_task(task_id)。",
+                            "要求：调用 finalize_task(task_id, keep_record=false)。",
                         ]
                     ),
                 }
             ],
+            checkpoint_ns="supervisor",
+            thread_id=_supervision_thread_id(),
         )
         last_supervision_task_id = ""
         summarized = _summarize_tool_output_for_terminal(tool_output)
@@ -273,6 +447,9 @@ def build_observer_agent(
             remember,
             recall,
             forget,
+            shared_context_put,
+            shared_context_get,
+            shared_context_forget,
             memory_core_read,
             memory_user_read,
             memory_kg_recall,
@@ -281,6 +458,7 @@ def build_observer_agent(
             delegate_to_executor,
             delegate_to_supervisor,
             append_core_memory,
+            append_episodic_memory,
             write_core_memory,
             start_supervision,
             supervised_check,
@@ -297,6 +475,7 @@ def build_observer_agent(
             "严禁出现或近似表达：让我委派给监督者/执行者、我去叫监督者/执行者、我把任务交给监督者/执行者、后台由监督者/执行者处理。",
             "复杂任务时必须在内部启用监督流程：先调用 start_supervision(task) 获取 task_id，并在每次执行后调用 supervised_check(task_id, executor_result)，完成后调用 finish_supervision(task_id)。",
             "你可以使用 remember/recall/forget 管理你自己的会话记忆。",
+            "你可以使用 shared_context_put/shared_context_get/shared_context_forget 管理跨回合可复用的共享上下文。",
             "灵魂/特性/身份：始终以 memory_core_read 读取的 core 记忆为准，并在关键决策时对齐。",
             "每次会话开始时，先用 memory_core_read 分别读取 identity 与 traits：若内容仍是默认模板/信息为空/缺少明确的名字或表达风格，则在与你的正常回复里自然插入一次简短引导（2~4 轮问题）。引导结束后把稳定信息写入 core：identity（包含名字、边界，并追加一行 onboarding_status: done）、traits（表达风格/协作方式）、user（用户偏好与目标摘要）。",
             "当用户要求设定/修改你的身体、性格、表达风格、身份边界、原则时，你必须把稳定信息写入 core 记忆：用 append_core_memory(kind, content) 委派执行者追加写入（identity/traits/soul/user）。需要覆盖写入时，使用 write_core_memory(kind, content)。",
@@ -317,5 +496,8 @@ def build_observer_agent(
         model,
         tools=tools,
         system_prompt=system_prompt,
-        middleware=[skill_middleware],
+        middleware=[skill_middleware, memory_middleware],
+        state_schema=UnifiedAgentState,
+        store=store,
+        checkpointer=checkpointer,
     )
