@@ -145,17 +145,17 @@ def main() -> None:
     if global_skills_dir.exists() and global_skills_dir not in {p.resolve() for p in skills_dirs}:
         skills_dirs.append(global_skills_dir)
 
-    def _build_observer() -> tuple[object, CliState]:
-        observer, catalog, count = build_agent(
+    def _build_agent() -> tuple[object, CliState]:
+        agent, catalog, count = build_agent(
             skills_dirs=skills_dirs,
             project_root=project_root,
             output_dir=output_dir,
             work_dir=work_dir,
             model_name=args.model,
         )
-        return observer, CliState(skill_catalog_text=catalog, skill_count=count)
+        return agent, CliState(skill_catalog_text=catalog, skill_count=count)
 
-    agent, state = _build_observer()
+    agent, state = _build_agent()
 
     system_manager: SystemManager | None = None
     try:

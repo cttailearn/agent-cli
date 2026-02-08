@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import os
-import sqlite3
 import threading
 import time
 import uuid
@@ -176,128 +175,10 @@ def count_skills_in_catalog_text(skill_catalog_text: str) -> int:
     return sum(1 for line in lines if line.startswith("- "))
 
 
-def _maybe_collapse_stutter(text: str) -> str:
-    s = text or ""
-    if len(s) < 12:
-        return s
-
-    def _allow_ws_join_for_single_char(ch: str) -> bool:
-        if not ch:
-            return False
-        if "\u4e00" <= ch <= "\u9fff":
-            return True
-        if ch.isalnum():
-            return False
-        return True
-
-    repeats = 0
-    repeats_ge2 = 0
-    repeats_ge3 = 0
-    distinct: set[str] = set()
-    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in s)
-    max_seg_len = min(12, max(1, len(s) // 4))
-    for seg_len in range(1, max_seg_len + 1):
-        i = 0
-        while i + 2 * seg_len <= len(s):
-            a = s[i : i + seg_len]
-            b = s[i + seg_len : i + 2 * seg_len]
-            if a and a == b:
-                repeats += 1
-                if seg_len >= 2:
-                    repeats_ge2 += 1
-                if seg_len >= 3:
-                    repeats_ge3 += 1
-                if len(distinct) < 12:
-                    distinct.add(a)
-                i += seg_len * 2
-                continue
-            if i + seg_len < len(s) and s[i + seg_len].isspace():
-                if seg_len == 1 and not _allow_ws_join_for_single_char(a):
-                    i += 1
-                    continue
-                j = i + seg_len
-                while j < len(s) and s[j].isspace():
-                    j += 1
-                if j + seg_len <= len(s):
-                    b2 = s[j : j + seg_len]
-                    if a and a == b2:
-                        repeats += 1
-                        if seg_len >= 2:
-                            repeats_ge2 += 1
-                        if seg_len >= 3:
-                            repeats_ge3 += 1
-                        if len(distinct) < 12:
-                            distinct.add(a)
-                        i = j + seg_len
-                        continue
-            i += 1
-
-    if repeats < 2:
-        return s
-
-    if has_cjk:
-        if repeats_ge2 < 1 and repeats < 4:
-            return s
-    else:
-        if repeats_ge3 < 2 and (repeats < 6 or len(distinct) < 3):
-            return s
-        if repeats_ge3 < 2 and len(distinct) < 2:
-            return s
-
-    if len(distinct) < 1:
-        return s
-
-    out: list[str] = []
-    i = 0
-    longest = min(24, max(8, len(s) // 3))
-    while i < len(s):
-        collapsed = False
-        for seg_len in range(longest, 0, -1):
-            if i + 2 * seg_len > len(s):
-                continue
-            a = s[i : i + seg_len]
-            b = s[i + seg_len : i + 2 * seg_len]
-            if a and a == b:
-                out.append(a)
-                j = i + seg_len * 2
-                while j + seg_len <= len(s) and s[j : j + seg_len] == a:
-                    j += seg_len
-                i = j
-                collapsed = True
-                break
-            if i + seg_len < len(s) and s[i + seg_len].isspace():
-                if seg_len == 1 and not _allow_ws_join_for_single_char(a):
-                    continue
-                j = i + seg_len
-                while j < len(s) and s[j].isspace():
-                    j += 1
-                if j + seg_len <= len(s) and a and s[j : j + seg_len] == a:
-                    out.append(a)
-                    j2 = j + seg_len
-                    while True:
-                        if j2 + seg_len <= len(s) and s[j2 : j2 + seg_len] == a:
-                            j2 += seg_len
-                            continue
-                        k = j2
-                        while k < len(s) and s[k].isspace():
-                            k += 1
-                        if k != j2 and k + seg_len <= len(s) and s[k : k + seg_len] == a:
-                            j2 = k + seg_len
-                            continue
-                        break
-                    i = j2
-                    collapsed = True
-                    break
-        if not collapsed:
-            out.append(s[i])
-            i += 1
-    return "".join(out)
-
-
 def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
     content = getattr(msg, "content", "") or ""
     if isinstance(content, str):
-        return _maybe_collapse_stutter(content)
+        return content
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
@@ -307,75 +188,8 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
                 text = item.get("text")
                 if isinstance(text, str) and text:
                     parts.append(text)
-        if not parts:
-            return ""
-        if len(parts) == 1:
-            return _maybe_collapse_stutter(parts[0])
-
-        uniq: list[str] = []
-        for s in parts:
-            if s not in uniq:
-                uniq.append(s)
-        parts = uniq
-
-        parts_by_len = sorted(parts, key=len, reverse=True)
-        for candidate in parts_by_len:
-            if all((p in candidate) for p in parts):
-                return _maybe_collapse_stutter(candidate)
-
-        kept_rev: list[str] = []
-        for s in reversed(parts):
-            if any(s and s in k for k in kept_rev):
-                continue
-            kept_rev.append(s)
-        kept = list(reversed(kept_rev))
-
-        assembled = ""
-        for s in kept:
-            if not assembled:
-                assembled = s
-                continue
-            if s.startswith(assembled):
-                assembled = s
-                continue
-            if assembled.endswith(s):
-                continue
-            max_k = min(len(assembled), len(s))
-            k_found = 0
-            for k in range(max_k, 0, -1):
-                if assembled.endswith(s[:k]):
-                    k_found = k
-                    break
-            if k_found:
-                assembled += s[k_found:]
-            else:
-                assembled += s
-        return _maybe_collapse_stutter(assembled)
-    return _maybe_collapse_stutter(str(content))
-
-
-def self_test_extract_text_dedup() -> bool:
-    class _Msg:
-        def __init__(self, content: object) -> None:
-            self.content = content
-
-    cases: list[tuple[object, str]] = [
-        (["按照", "我将按照"], "我将按照"),
-        (["我将", "按照", "我将按照"], "我将按照"),
-        (["Markdown", "Markdown"], "Markdown"),
-        (["foo", "bar"], "foobar"),
-        ([{"text": "按照"}, {"text": "我将按照"}], "我将按照"),
-        (["主人", "主人", "，", "，", "我来", "我来"], "主人，我来"),
-        (["主人", "主人，", "主人，我来"], "主人，我来"),
-        (["主人主人，，我来我来为您为您搜索前端搜索前端设计相关的设计相关的技能。"], "主人，我来为您搜索前端设计相关的技能。"),
-        ("主人主人，，我来我来检查浏览器检查浏览器自动化技能自动化技能的 setup.json setup.json 文件 文件状态。", "主人，我来检查浏览器自动化技能的 setup.json 文件状态。"),
-        ("npx npx skills find skills find frontend design", "npx skills find frontend design"),
-        ("bookkeeper", "bookkeeper"),
-    ]
-    for content, expected in cases:
-        if _extract_text(_Msg(content)) != expected:
-            return False
-    return True
+        return "".join(parts)
+    return str(content)
 
 
 class _LockedProxy:
@@ -480,37 +294,31 @@ def _is_tool_calls_sequence_error(e: Exception) -> bool:
     return False
 
 
-def _stream_text_delta(new_text: str, *, last_seen: str | None, assembled: str) -> tuple[str, str | None]:
-    def _strip_overlap(prev: str, delta: str) -> str:
-        if not prev or not delta:
-            return delta
-        max_k = min(len(prev), len(delta))
-        for k in range(max_k, 0, -1):
-            if prev.endswith(delta[:k]):
-                return delta[k:]
-        return delta
-
+def _stream_text_delta(new_text: str, *, assembled: str) -> tuple[str, str]:
     t = new_text or ""
     if not t:
-        return "", last_seen
-    if last_seen is not None and t == last_seen:
-        return "", last_seen
-    if assembled and t.startswith(assembled):
-        delta = t[len(assembled) :]
-        return _strip_overlap(assembled, delta), t
-    if last_seen and t.startswith(last_seen):
-        delta = t[len(last_seen) :]
-        return _strip_overlap(assembled, delta), t
-    if last_seen and last_seen.startswith(t):
-        return "", last_seen
-    if assembled and assembled.endswith(t):
-        return "", t
-    if assembled:
-        max_k = min(len(assembled), len(t))
-        for k in range(max_k, 0, -1):
-            if assembled.endswith(t[:k]):
-                return _strip_overlap(assembled, t[k:]), t
-    return _strip_overlap(assembled, t), t
+        return "", assembled
+
+    base = assembled or ""
+    if not base:
+        return t, t
+
+    if t.startswith(base):
+        delta = t[len(base) :]
+        return delta, t
+
+    if len(t) <= 4:
+        return t, base + t
+
+    max_k = min(len(base), len(t))
+    for k in range(max_k, 0, -1):
+        if base.endswith(t[:k]):
+            delta = t[k:]
+            if not delta:
+                return "", base
+            return delta, base + delta
+
+    return t, base + t
 
 
 
@@ -549,8 +357,6 @@ def stream_nested_agent_reply(agent, messages: list[dict[str, str]], *, label: s
             tool_chunks: list[str] = []
             assistant_buf = ""
             last_flush_t = time.monotonic()
-            last_assistant_seen: str | None = None
-            last_tool_seen: str | None = None
             assistant_assembled = ""
             tool_assembled = ""
 
@@ -577,22 +383,16 @@ def stream_nested_agent_reply(agent, messages: list[dict[str, str]], *, label: s
                     if isinstance(msg, AIMessageChunk):
                         capture_token_usage_from_message(msg)
                         text = _extract_text(msg)
-                        delta, last_assistant_seen = _stream_text_delta(
-                            text, last_seen=last_assistant_seen, assembled=assistant_assembled
-                        )
+                        delta, assistant_assembled = _stream_text_delta(text, assembled=assistant_assembled)
                         if delta:
-                            assistant_assembled += delta
                             assistant_buf += delta
                             _flush_assistant(force=False)
                             chunks.append(delta)
                         _drain_actions()
                     elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
                         text = _extract_text(msg)
-                        delta, last_tool_seen = _stream_text_delta(
-                            text, last_seen=last_tool_seen, assembled=tool_assembled
-                        )
+                        delta, tool_assembled = _stream_text_delta(text, assembled=tool_assembled)
                         if delta:
-                            tool_assembled += delta
                             tool_chunks.append(delta)
                             summarized = _summarize_tool_output_for_terminal(delta)
                             if summarized:
@@ -664,8 +464,6 @@ def _run_agent_to_text(
         for attempt in range(2):
             assistant_assembled = ""
             tool_assembled = ""
-            last_assistant_seen: str | None = None
-            last_tool_seen: str | None = None
             try:
                 for event in agent.stream(
                     {"messages": messages},
@@ -679,18 +477,10 @@ def _run_agent_to_text(
                     if isinstance(msg, AIMessageChunk):
                         capture_token_usage_from_message(msg)
                         text = _extract_text(msg)
-                        delta, last_assistant_seen = _stream_text_delta(
-                            text, last_seen=last_assistant_seen, assembled=assistant_assembled
-                        )
-                        if delta:
-                            assistant_assembled += delta
+                        delta, assistant_assembled = _stream_text_delta(text, assembled=assistant_assembled)
                     elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
                         text = _extract_text(msg)
-                        delta, last_tool_seen = _stream_text_delta(
-                            text, last_seen=last_tool_seen, assembled=tool_assembled
-                        )
-                        if delta:
-                            tool_assembled += delta
+                        delta, tool_assembled = _stream_text_delta(text, assembled=tool_assembled)
                 reply = assistant_assembled
                 tool_output = tool_assembled
                 break
@@ -784,57 +574,22 @@ def build_agent(
     skill_count = count_skills_in_catalog_text(skill_catalog_text)
     memory_middleware = create_memory_middleware(project_root)
     mcp_tools = load_mcp_tools_from_config()
-    agents_dir = (project_root / ".agents").resolve()
-    agents_dir.mkdir(parents=True, exist_ok=True)
+    (project_root / ".agents").mkdir(parents=True, exist_ok=True)
 
-    try:
-        from langgraph.store.sqlite import SqliteStore
+    from langgraph.checkpoint.memory import InMemorySaver
 
-        store_conn = sqlite3.connect(
-            str((agents_dir / "store.sqlite").resolve()),
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        try:
-            store_conn.execute("PRAGMA journal_mode=WAL;")
-            store_conn.execute("PRAGMA synchronous=NORMAL;")
-            store_conn.execute("PRAGMA busy_timeout=5000;")
-        except Exception:
-            pass
-        store = SqliteStore(store_conn)
-        store.setup()
-    except Exception:
-        from langgraph.store.memory import InMemoryStore
+    from memory.paths import langgraph_store_path
+    from memory.storage import PersistentInMemoryStore
 
-        store = InMemoryStore()
-
-    try:
-        from langgraph.checkpoint.sqlite import SqliteSaver
-
-        checkpoint_conn = sqlite3.connect(
-            str((agents_dir / "checkpoints.sqlite").resolve()),
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        try:
-            checkpoint_conn.execute("PRAGMA journal_mode=WAL;")
-            checkpoint_conn.execute("PRAGMA synchronous=NORMAL;")
-            checkpoint_conn.execute("PRAGMA busy_timeout=5000;")
-        except Exception:
-            pass
-        checkpointer = SqliteSaver(checkpoint_conn)
-    except Exception:
-        from langgraph.checkpoint.memory import InMemorySaver
-
-        checkpointer = InMemorySaver()
+    store = PersistentInMemoryStore(path=langgraph_store_path(project_root))
+    checkpointer = InMemorySaver()
 
     store = _LockedProxy(store)
 
-    from .executor_agent import build_executor_agent, executor_tools
-    from .observer_agent import build_observer_agent
-    from .supervisor_agent import build_supervisor_agent
+    from .agent import build_single_agent
 
-    executor_agent = build_executor_agent(
+    agent = build_single_agent(
+        skills_dirs=skills_dirs,
         project_root=project_root,
         output_dir=output_dir,
         work_dir=work_dir,
@@ -846,33 +601,4 @@ def build_agent(
         checkpointer=checkpointer,
     )
 
-    executor_tools_list = executor_tools(mcp_tools=mcp_tools, skill_middleware=skill_middleware)
-
-    supervisor_agent, supervisor_tools = build_supervisor_agent(
-        model_name=model_name,
-        skill_middleware=skill_middleware,
-        memory_middleware=memory_middleware,
-        skills_dirs=skills_dirs,
-        project_root=project_root,
-        output_dir=output_dir,
-        work_dir=work_dir,
-        store=store,
-        checkpointer=checkpointer,
-    )
-
-    observer_agent = build_observer_agent(
-        project_root=project_root,
-        output_dir=output_dir,
-        work_dir=work_dir,
-        model_name=model_name,
-        skill_middleware=skill_middleware,
-        memory_middleware=memory_middleware,
-        executor_agent=executor_agent,
-        executor_tools=executor_tools_list,
-        supervisor_agent=supervisor_agent,
-        supervisor_tools=supervisor_tools,
-        store=store,
-        checkpointer=checkpointer,
-    )
-
-    return observer_agent, skill_catalog_text, skill_count
+    return agent, skill_catalog_text, skill_count

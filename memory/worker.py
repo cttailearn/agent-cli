@@ -13,7 +13,8 @@ from .model import init_model
 from .storage import KnowledgeGraphStore
 
 
-_FRONT_MATTER_RE = re.compile(r"^---\\s*$")
+_FRONT_MATTER_RE = re.compile(r"^---\s*$")
+_TURN_RE = re.compile(r"^##\s+Turn\s+(\d+)\s*$", re.MULTILINE)
 
 
 def _extract_text(msg: object) -> str:
@@ -46,6 +47,27 @@ def _parse_ts_from_md(md: str) -> str:
     return ""
 
 
+def _split_turns(md: str) -> list[tuple[int, str]]:
+    text = md or ""
+    matches = list(_TURN_RE.finditer(text))
+    if not matches:
+        body = text.strip()
+        return [(0, body)] if body else []
+    out: list[tuple[int, str]] = []
+    for i, m in enumerate(matches):
+        raw_n = m.group(1)
+        try:
+            n = int(raw_n)
+        except Exception:
+            continue
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        chunk = text[start:end].strip()
+        if chunk:
+            out.append((n, chunk))
+    return out
+
+
 def _safe_json_loads(text: str) -> dict[str, object] | None:
     raw = (text or "").strip()
     if not raw:
@@ -71,12 +93,14 @@ def _node_key(name: str, typ: str) -> str:
 def _upsert_graph(
     *,
     store: KnowledgeGraphStore,
-    doc_path: Path,
+    doc_id: str,
     doc_ts: str,
     doc_hash: str,
     extracted: dict[str, object],
 ) -> None:
-    rel_doc = doc_path.as_posix()
+    rel_doc = (doc_id or "").strip()
+    if not rel_doc:
+        return
     now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with store.with_lock():
         g = store.get_graph_mut()
@@ -94,6 +118,14 @@ def _upsert_graph(
         if not isinstance(edges, list):
             edges = []
             g["edges"] = edges
+        else:
+            edges[:] = [e for e in edges if not (isinstance(e, dict) and e.get("doc") == rel_doc)]
+        for n in nodes.values():
+            if not isinstance(n, dict):
+                continue
+            mentions = n.get("mentions")
+            if isinstance(mentions, list):
+                n["mentions"] = [m for m in mentions if not (isinstance(m, dict) and m.get("doc") == rel_doc)]
 
         entities = extracted.get("entities", [])
         if not isinstance(entities, list):
@@ -198,16 +230,27 @@ def ingest_chat_markdown(*, model, store: KnowledgeGraphStore, path: Path) -> tu
     if not p.exists() or not p.is_file():
         return False, "not_found"
     md = p.read_text(encoding="utf-8", errors="replace")
-    doc_hash = store.document_hash(md)
-    doc_ts = _parse_ts_from_md(md)
+    doc_ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    turns = _split_turns(md)
+    if not turns:
+        return True, "empty"
 
+    doc_prefix = p.as_posix()
+    to_process: list[tuple[int, str, str]] = []
     with store.with_lock():
         g = store.get_graph_mut()
         docs = g.get("documents")
-        if isinstance(docs, dict):
-            meta = docs.get(p.as_posix())
+        docs_dict = docs if isinstance(docs, dict) else {}
+        for turn_n, chunk in turns:
+            doc_id = doc_prefix if turn_n == 0 else f"{doc_prefix}#t{turn_n}"
+            doc_hash = store.document_hash(chunk)
+            meta = docs_dict.get(doc_id)
             if isinstance(meta, dict) and meta.get("hash") == doc_hash:
-                return True, "skipped"
+                continue
+            to_process.append((turn_n, doc_id, chunk))
+
+    if not to_process:
+        return True, "skipped"
 
     sys_text = "\n".join(
         [
@@ -224,20 +267,29 @@ def ingest_chat_markdown(*, model, store: KnowledgeGraphStore, path: Path) -> tu
             "- 只抽取对未来有用、可复用的稳定事实与偏好",
         ]
     )
-    user_text = "\n".join(
-        [
-            f"doc_path={p.as_posix()}",
-            f"doc_ts={doc_ts}",
-            "doc_markdown:",
-            md,
-        ]
-    )
-    resp = model.invoke([SystemMessage(content=sys_text), HumanMessage(content=user_text)])
-    extracted = _safe_json_loads(_extract_text(resp))
-    if extracted is None:
-        extracted = {"entities": [], "relations": []}
-    _upsert_graph(store=store, doc_path=p, doc_ts=doc_ts or "", doc_hash=doc_hash, extracted=extracted)
-    return True, "ok"
+    ok_any = False
+    for turn_n, doc_id, chunk in to_process:
+        user_text = "\n".join(
+            [
+                f"doc_id={doc_id}",
+                f"doc_path={p.as_posix()}",
+                f"doc_ts={doc_ts}",
+                f"turn={turn_n}",
+                "doc_markdown:",
+                chunk,
+            ]
+        )
+        try:
+            resp = model.invoke([SystemMessage(content=sys_text), HumanMessage(content=user_text)])
+        except Exception:
+            continue
+        extracted = _safe_json_loads(_extract_text(resp))
+        if extracted is None:
+            extracted = {"entities": [], "relations": []}
+        doc_hash = store.document_hash(chunk)
+        _upsert_graph(store=store, doc_id=doc_id, doc_ts=doc_ts or "", doc_hash=doc_hash, extracted=extracted)
+        ok_any = True
+    return (True, "ok") if ok_any else (False, "invoke_failed")
 
 
 class KnowledgeGraphWorker:
@@ -294,4 +346,3 @@ class KnowledgeGraphWorker:
                 ingest_chat_markdown(model=model, store=self.kg_store, path=p)
             except Exception:
                 continue
-

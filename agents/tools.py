@@ -12,6 +12,8 @@ from fnmatch import fnmatch
 from langchain_core.tools import tool
 from pathlib import Path
 
+from langgraph.prebuilt import ToolRuntime
+
 from .exec import build_langchain_exec_tools, sanitize_exec_env, sandbox_validate_command
 from . import console_print
 
@@ -1427,19 +1429,6 @@ def memory_core_write(kind: str, content: str) -> str:
 
 
 @tool
-def memory_episodic_append(content: str) -> str:
-    """Append one episodic memory entry into fragmented markdown (5 entries per file)."""
-    try:
-        from memory.manager import append_episodic_memory
-    except Exception as e:
-        return f"Import failed: {e}"
-    model_name = (os.environ.get("AGENT_MODEL_NAME") or os.environ.get("LC_MODEL") or "deepseek:deepseek-reasoner").strip()
-    ok, msg = append_episodic_memory(project_root=_memory_project_root(), model_name=model_name, content=content)
-    _log_action({"kind": "memory_episodic_append", "ok": bool(ok), "result": msg, "ts": time.time()})
-    return msg if ok else f"Write failed: {msg}"
-
-
-@tool
 def memory_kg_recall(query: str, limit: int = 12) -> str:
     """Search the knowledge graph built from chat logs."""
     try:
@@ -1504,3 +1493,138 @@ def memory_user_write(content: str) -> str:
     except OSError as e:
         _log_action({"kind": "memory_user_write", "ok": False, "path": p.as_posix(), "error": str(e), "ts": time.time()})
         return f"Write failed: {e}"
+
+
+def _runtime_thread_id(runtime: ToolRuntime) -> str:
+    cfg = getattr(runtime, "config", None) or {}
+    if isinstance(cfg, dict):
+        configurable = cfg.get("configurable") or {}
+        if isinstance(configurable, dict):
+            tid = (configurable.get("thread_id") or "").strip()
+            if tid:
+                return tid
+    return (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
+
+
+def _parse_namespace(namespace: str, *, default: tuple[str, ...] = ("default",)) -> tuple[str, ...]:
+    raw = (namespace or "").strip()
+    if not raw:
+        return default
+    parts = [p.strip() for p in raw.replace("\\", "/").split("/") if p.strip()]
+    return tuple(parts) if parts else default
+
+
+@tool
+def memory_ltm_put(namespace: str, key: str, value: dict[str, object], runtime: ToolRuntime) -> str:
+    """Store a long-term memory JSON document under (namespace, key)."""
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return "Store unavailable."
+    ns = _parse_namespace(namespace, default=("mem",))
+    k = (key or "").strip()
+    if not k:
+        return "Missing key."
+    v = value if isinstance(value, dict) else {}
+    if "text" not in v:
+        try:
+            v["text"] = json.dumps(v, ensure_ascii=False, sort_keys=True)
+        except Exception:
+            v["text"] = str(v)
+    store.put(ns, k, v)
+    return "OK"
+
+
+@tool
+def memory_ltm_get(namespace: str, key: str, runtime: ToolRuntime) -> str:
+    """Get a long-term memory JSON document by (namespace, key)."""
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return ""
+    ns = _parse_namespace(namespace, default=("mem",))
+    k = (key or "").strip()
+    if not k:
+        return ""
+    item = store.get(ns, k)
+    if item is None:
+        return ""
+    val = getattr(item, "value", None)
+    if isinstance(val, dict):
+        return json.dumps(val, ensure_ascii=False, sort_keys=True)
+    return ""
+
+
+@tool
+def memory_ltm_delete(namespace: str, key: str, runtime: ToolRuntime) -> str:
+    """Delete a long-term memory item by (namespace, key)."""
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return "OK"
+    ns = _parse_namespace(namespace, default=("mem",))
+    k = (key or "").strip()
+    if not k:
+        return "Missing key."
+    store.delete(ns, k)
+    return "OK"
+
+
+@tool
+def memory_ltm_search(
+    namespace: str,
+    runtime: ToolRuntime,
+    query: str = "",
+    filter_json: str = "",
+    limit: int = 12,
+) -> str:
+    """Search long-term memory within a namespace (vector similarity + optional JSON filter)."""
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return "Store unavailable."
+    ns = _parse_namespace(namespace, default=("mem",))
+    q = (query or "").strip() or None
+    filt = None
+    raw_filter = (filter_json or "").strip()
+    if raw_filter:
+        try:
+            parsed = json.loads(raw_filter)
+            if isinstance(parsed, dict):
+                filt = parsed
+        except Exception:
+            filt = None
+    n = max(1, min(50, int(limit or 12)))
+    try:
+        items = store.search(ns, query=q, filter=filt, limit=n)
+    except TypeError:
+        items = store.search(ns, query=q, filter=filt)
+        if isinstance(items, list):
+            items = items[:n]
+    out: list[dict[str, object]] = []
+    if isinstance(items, list):
+        for it in items:
+            out.append(
+                {
+                    "namespace": list(getattr(it, "namespace", ()) or ()),
+                    "key": getattr(it, "key", ""),
+                    "score": getattr(it, "score", None),
+                    "value": getattr(it, "value", None),
+                }
+            )
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def memory_ltm_list_namespaces(runtime: ToolRuntime, prefix: str = "") -> str:
+    """List available namespaces in the long-term memory store."""
+    store = getattr(runtime, "store", None)
+    if store is None:
+        return "[]"
+    p = _parse_namespace(prefix, default=())
+    try:
+        namespaces = store.list_namespaces(prefix=p if p else None, limit=200)
+    except TypeError:
+        namespaces = store.list_namespaces()
+    out: list[list[str]] = []
+    if isinstance(namespaces, list):
+        for ns in namespaces:
+            if isinstance(ns, tuple):
+                out.append(list(ns))
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)

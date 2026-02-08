@@ -181,8 +181,6 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
     last_flush_t = time.monotonic()
     tool_stream_buf = ""
     last_action_index = 0
-    last_assistant_seen: str | None = None
-    last_tool_seen: str | None = None
     assistant_assembled = ""
     tool_assembled = ""
 
@@ -271,11 +269,8 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
                 if isinstance(msg, AIMessageChunk):
                     capture_token_usage_from_message(msg)
                     text = _extract_text(msg)
-                    delta, last_assistant_seen = _stream_text_delta(
-                        text, last_seen=last_assistant_seen, assembled=assistant_assembled
-                    )
+                    delta, assistant_assembled = _stream_text_delta(text, assembled=assistant_assembled)
                     if delta:
-                        assistant_assembled += delta
                         _switch_to_assistant()
                         assistant_buf += delta
                         _flush_assistant(force=False)
@@ -283,9 +278,8 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
                     _drain_actions()
                 elif isinstance(msg, (ToolMessage, ToolMessageChunk)):
                     text = _extract_text(msg)
-                    delta, last_tool_seen = _stream_text_delta(text, last_seen=last_tool_seen, assembled=tool_assembled)
+                    delta, tool_assembled = _stream_text_delta(text, assembled=tool_assembled)
                     if delta:
-                        tool_assembled += delta
                         tool_chunks.append(delta)
                         has_tool_output = True
                         if state.show_tool_output:

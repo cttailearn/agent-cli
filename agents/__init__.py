@@ -4,6 +4,13 @@ import sys
 import threading
 import io
 
+try:
+    from . import agent as _single_agent
+
+    sys.modules.setdefault(__name__ + ".single_agent", _single_agent)
+except Exception:
+    pass
+
 _CONSOLE_LOCK = threading.RLock()
 _CONSOLE_AT_LINE_START = True
 

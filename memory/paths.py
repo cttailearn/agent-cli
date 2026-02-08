@@ -42,13 +42,6 @@ def chats_dir(project_root: Path) -> Path:
     return (memory_root(project_root) / "chats").resolve()
 
 
-def episodic_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_EPISODIC_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (memory_root(project_root) / "episodic").resolve()
-
-
 def kg_dir(project_root: Path) -> Path:
     raw = (os.environ.get("AGENT_MEMORY_KG_DIR") or "").strip()
     if raw:
@@ -102,4 +95,11 @@ def core_file_by_kind(project_root: Path, kind: str) -> Path | None:
     if k in {"user", "用户"}:
         return user_path(project_root)
     return None
+
+
+def langgraph_store_path(project_root: Path) -> Path:
+    raw = (os.environ.get("AGENT_LANGGRAPH_STORE_PATH") or "").strip()
+    if raw:
+        return _resolve_path(project_root, raw)
+    return (memory_root(project_root) / "langgraph_store.json").resolve()
 

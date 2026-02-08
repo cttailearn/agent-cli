@@ -2,7 +2,7 @@
 
 ## 1. 项目概述
 
-**agent-cli** 是一个基于 LangChain 的多智能体命令行工具，支持技能管理、记忆系统、工具调用和监督机制。项目采用多智能体架构，包含执行者（Executor）、观察者（Observer）和监督者（Supervisor）三个角色，通过分工协作完成复杂任务。
+**agent-cli** 是一个基于 LangChain 的单智能体命令行工具，支持技能管理、记忆系统、工具调用与系统任务调度。智能体在同一条执行链路上完成“理解 → 规划 → 执行”。
 
 **核心目标**：提供一个可扩展的、具有长期记忆和技能管理能力的智能体框架，支持本地文件操作、命令行执行、知识图谱构建等。
 
@@ -38,14 +38,15 @@
 
 ### 1.1.4 记忆系统路径（memory/paths.py）
 
-以下配置支持相对路径（相对 `AGENT_PROJECT_DIR`）或绝对路径（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L7-L12)）：
+以下配置支持相对路径（相对 `AGENT_PROJECT_DIR`）或绝对路径（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L7-L12)）：
 
-- `AGENT_MEMORY_DIR`：记忆根目录；默认 `memory`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L24-L29)）。
-- `AGENT_MEMORY_CORE_DIR`：core 记忆目录；默认等同 `AGENT_MEMORY_DIR`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L31-L35)）。
-- `AGENT_MEMORY_CHATS_DIR`：聊天记录目录；默认 `{AGENT_MEMORY_DIR}/chats`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L38-L43)）。
-- `AGENT_MEMORY_KG_DIR`：知识图谱目录；默认 `{AGENT_MEMORY_DIR}/kg`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L45-L49)）。
-- `AGENT_MEMORY_GRAPH_PATH`：知识图谱文件路径；默认 `{AGENT_MEMORY_KG_DIR}/graph.json`（见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L52-L56)）。
-- `AGENT_MEMORY_SOUL_PATH` / `AGENT_MEMORY_TRAITS_PATH` / `AGENT_MEMORY_IDENTITY_PATH` / `AGENT_MEMORY_USER_PATH`：core 记忆文件路径（默认位于 core 目录，见 [paths.py](file:///g:/AI/agent-cli/memory/paths.py#L59-L84)）。
+- `AGENT_MEMORY_DIR`：记忆根目录；默认 `memory`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L24-L29)）。
+- `AGENT_MEMORY_CORE_DIR`：core 记忆目录；默认等同 `AGENT_MEMORY_DIR`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L31-L35)）。
+- `AGENT_MEMORY_CHATS_DIR`：聊天记录目录；默认 `{AGENT_MEMORY_DIR}/chats`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L38-L43)）。
+- `AGENT_MEMORY_KG_DIR`：知识图谱目录；默认 `{AGENT_MEMORY_DIR}/kg`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L45-L49)）。
+- `AGENT_MEMORY_GRAPH_PATH`：知识图谱文件路径；默认 `{AGENT_MEMORY_KG_DIR}/graph.json`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L52-L56)）。
+- `AGENT_MEMORY_SOUL_PATH` / `AGENT_MEMORY_TRAITS_PATH` / `AGENT_MEMORY_IDENTITY_PATH` / `AGENT_MEMORY_USER_PATH`：core 记忆文件路径（默认位于 core 目录，见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L59-L84)）。
+- `AGENT_LANGGRAPH_STORE_PATH`：LangGraph 长期记忆 Store 的持久化路径；默认 `{AGENT_MEMORY_DIR}/langgraph_store.json`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L107-L111)）。
 
 ### 1.1.5 运行时控制（递归深度）
 
@@ -57,9 +58,7 @@
 agent-cli/
 ├── main.py                      # 主入口，CLI 参数解析与初始化
 ├── agents/                      # 智能体实现
-│   ├── executor_agent.py        # 执行者智能体
-│   ├── observer_agent.py        # 观察者智能体
-│   ├── supervisor_agent.py      # 监督者智能体
+│   ├── single_agent.py          # 单智能体（对话 + 执行）
 │   ├── runtime.py               # 智能体构建与运行时支持
 │   └── __init__.py
 ├── memory/                      # 记忆系统
@@ -91,8 +90,7 @@ agent-cli/
 ### 模块依赖关系
 
 - `main.py` → `agents.runtime`、`memory.manager`、`terminal_display`
-- `agents.runtime` → `executor_agent`、`observer_agent`、`supervisor_agent`、`skills_support`、`tools`
-- 智能体之间通过工具调用和委派协作
+- `agents.runtime` → `single_agent`、`skills_support`、`tools`
 - 记忆系统独立，通过 `MemoryManager` 统一管理
 - 技能系统通过 `SkillMiddleware` 注入到智能体
 
@@ -102,36 +100,22 @@ agent-cli/
 
 - 负责命令行参数解析，环境变量加载，目录初始化
 - 创建 `MemoryManager` 启动知识图谱工作线程
-- 调用 `build_agent` 构建观察者智能体（顶层智能体）
+- 调用 `build_agent` 构建单智能体
 - 支持单次执行和交互模式
 - 代码清晰，错误处理较为完善
 
 ### 3.2 智能体模块 (agents/)
 
-#### 3.2.1 执行者智能体 (executor_agent.py)
+#### 3.2.1 单智能体 (single_agent.py)
 
-- **职责**：执行具体的工具调用（文件读写、命令执行等），不直接与用户对话
-- **工具集**：读写文件、执行命令、调用 MCP 工具、技能工具等
-- **系统提示**：强调“严禁虚构已执行的动作”，必须返回可验证结果
-- **设计特点**：严格限制副作用操作，所有动作必须通过工具完成
+- **职责**：与用户对话、理解意图、规划步骤，并在需要时直接执行（读写文件、运行命令、调用外部工具）
+- **工具集**：文件/命令/MCP/技能管理/记忆检索与写入等统一在一个工具集合中
+- **会话与共享上下文**：提供轻量的会话级记忆与跨回合共享上下文读写工具
+- **设计特点**：减少额外模型往返，执行链路更短，便于调试与部署
 
-#### 3.2.2 观察者智能体 (observer_agent.py)
+#### 3.2.2 运行时 (runtime.py)
 
-- **职责**：与用户对话、理解意图、规划步骤、维护会话记忆，委派任务给执行者
-- **工具集**：委派工具（`delegate_to_executor`、`delegate_to_supervisor`）、记忆工具、知识图谱检索
-- **复杂任务处理**：通过 `start_supervision`、`supervised_check`、`finish_supervision` 启动监督流程
-- **设计特点**：作为用户与执行者之间的桥梁，拥有会话记忆和任务分解能力
-
-#### 3.2.3 监督者智能体 (supervisor_agent.py)
-
-- **职责**：判断任务完成情况，记录任务状态，管理技能生命周期
-- **工具集**：任务记忆工具（`start_task`、`add_observation` 等）、技能管理工具（`skills_scan`、`skills_install` 等）
-- **技能优化**：自动检测缺失技能，生成优化任务
-- **设计特点**：不直接与用户对话，专注于任务质量和技能生态
-
-#### 3.2.4 运行时 (runtime.py)
-
-- **核心函数**：`build_agent` 负责构建三个智能体并组装成观察者智能体
+- **核心函数**：`build_agent` 负责构建单智能体并注入中间件与 Store/Checkpointer
 - **模型初始化**：支持 DeepSeek 模型和通用 LangChain 模型
 - **工具格式化**：`_format_tools` 提供统一的工具描述输出
 - **递归限制**：通过环境变量 `AGENT_RECURSION_LIMIT` 控制工具调用深度
@@ -188,21 +172,17 @@ agent-cli/
 
 #### 3.4.4 当用户要求“添加技能”时的工作流程（实现视角）
 
-这里的“添加技能”包含三类动作：安装生态技能（`npx skills add`）、查找生态技能（`npx skills find`）、创建本地技能（生成 `skills/<name>/SKILL.md`）。本项目把这些动作集中放在 Supervisor 侧执行，Observer 负责识别意图并委派。
+这里的“添加技能”包含三类动作：安装生态技能（`npx skills add`）、查找生态技能（`npx skills find`）、创建本地技能（生成 `skills/<name>/SKILL.md`）。本项目由单智能体直接调用技能管理工具完成上述动作。
 
-**A. 请求入口：用户 → Observer**
+**A. 请求入口：用户 → Agent**
 
-- 用户提出“帮我添加/安装某个技能”“找一个技能来做 X”一类需求后，Observer 按系统提示把技能生态相关动作委派给 Supervisor（[delegate_to_supervisor](file:///d:/tools/agent-cli/agents/observer_agent.py#L110-L121)）。
-- 委派本质是一次独立的模型运行：Observer 在工具里调用 `_run_agent_to_text(supervisor_agent, ...)`，流式收集 Supervisor 输出（[_run_agent_to_text](file:///d:/tools/agent-cli/agents/runtime.py#L201-L236)）。
-
-**B. Supervisor 执行技能管理：Supervisor → SkillManager → 文件系统 / 子进程**
-
-- Supervisor 暴露了一组技能管理工具：`skills_find/skills_install/skills_create/skills_enable/skills_disable/skills_remove/...`（见 [supervisor_agent.py](file:///d:/tools/agent-cli/agents/supervisor_agent.py#L139-L183)）。
+- 用户提出“帮我添加/安装某个技能”“找一个技能来做 X”一类需求后，Agent 直接调用 `skills_find/skills_install/skills_create/skills_enable/skills_disable/skills_remove/...` 完成操作（工具由单智能体提供）。
 - 这些工具都委托给 `SkillManager`（[SkillManager](file:///d:/tools/agent-cli/skills/skills_manager.py#L45-L229)）：
   - 查找：`skills_find(query)` → `SkillManager.find_via_npx` → `subprocess.run("npx skills find ...")`（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L189-L199)）。
   - 安装：`skills_install(spec)` → `SkillManager.install_via_npx` → `subprocess.run("npx skills add ... --dir <project_skills_dir>")`，安装后重新扫描新增技能并写入安装记录（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L173-L188)）。
   - 本地创建：`skills_create(name, description, body)` → 在项目技能目录创建 `skills/<name>/SKILL.md` 并写入 Front Matter，随后记录 installed（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L124-L149)）。
   - 禁用/启用/删除：通过 `.agents/skills_state.json` 维护 disabled 标记，或直接删除项目技能目录下的技能文件夹（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L98-L123)）。
+
 
 **C. 安装/创建后的“生效”机制：不需要重启进程**
 
@@ -215,9 +195,9 @@ agent-cli/
 
 “慢”通常不是单点原因，而是多段耗时叠加，尤其在 Windows + npx 的组合下更明显。
 
-**1) 多智能体委派带来的额外模型往返**
+**1) 模型往返与工具调用次数叠加**
 
-- Observer 把“技能管理动作”交给 Supervisor 执行（[delegate_to_supervisor](file:///d:/tools/agent-cli/agents/observer_agent.py#L110-L121)），等价于一次额外的模型调用；如果 Supervisor 再进行多步工具调用（find → install → scan），总体时延会线性叠加。
+- 单智能体模式下不再有额外的“跨智能体委派”模型调用，但如果一次交互里包含多步工具调用（find → install → scan），总体时延仍会线性叠加。
 
 **2) `npx skills ...` 子进程（最常见的大头）**
 
@@ -303,14 +283,10 @@ agent-cli/
 
 ## 5. 架构与设计模式
 
-### 5.1 多智能体架构
+### 5.1 单智能体架构
 
-- **角色分离**：
-  - **执行者**：仅执行，不对话
-  - **观察者**：仅对话，不执行
-  - **监督者**：仅判断，不对话不执行
-- **优点**：职责清晰，避免智能体越权，提高系统可控性
-- **通信机制**：通过工具调用和委派实现智能体间通信
+- **一体化链路**：同一智能体完成对话、规划与执行，降低额外模型往返
+- **可控性**：所有副作用仍通过工具完成（文件读写、命令执行等），便于审计与回放
 
 ### 5.2 中间件模式
 
@@ -410,7 +386,7 @@ agent-cli/
 
 ### 8.1 项目亮点
 
-1. **架构清晰**：多智能体分工明确，符合人类协作模式
+1. **架构清晰**：单智能体执行链路简洁，便于部署与调试
 2. **扩展性强**：技能系统和工具集易于扩展
 3. **记忆系统完善**：长期记忆 + 知识图谱，支持持续学习
 4. **安全考虑**：敏感文件防护，目录访问限制
@@ -431,7 +407,7 @@ agent-cli/
 
 ### 8.4 总体评价
 
-Agent-CLI 是一个设计精良、思路先进的多智能体框架，在架构设计、记忆系统和技能管理方面表现出色。代码质量较高，模块划分合理，具备良好的可维护性和扩展性。当前主要短板在于测试覆盖和部分安全隐患，建议在后续版本中重点加强。
+Agent-CLI 是一个设计精良、思路清晰的智能体 CLI，在记忆系统和技能管理方面表现出色。代码质量较高，模块划分合理，具备良好的可维护性和扩展性。当前主要短板在于测试覆盖，建议在后续版本中重点加强。
 
 ---
 
