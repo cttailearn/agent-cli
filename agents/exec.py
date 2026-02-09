@@ -5,6 +5,8 @@ import fnmatch
 import os
 import re
 import shlex
+import signal
+import subprocess
 import shutil
 import time
 import uuid
@@ -293,6 +295,34 @@ def _resolved_executable_path(exe: str) -> Optional[str]:
         return exe
     return shutil.which(exe)
 
+def _kill_process_tree(pid: int) -> None:
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        try:
+            asyncio.create_task(
+                asyncio.to_thread(
+                    subprocess.run,
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                    check=False,
+                )
+            )
+        except Exception:
+            pass
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+
 
 def _matches_allowlist(resolved_path: Optional[str], allowlist: List[str]) -> bool:
     if not resolved_path:
@@ -432,6 +462,7 @@ class ExecInput(BaseModel):
     timeout_sec: Optional[int] = Field(1800, description="Kill process after timeout seconds")
     stdin_data: Optional[str] = Field(None, description="Initial stdin data to write")
     stdin_eof: Optional[bool] = Field(False, description="Close stdin after writing stdin_data")
+    interactive: Optional[bool] = Field(False, description="Keep stdin open for interactive input")
     host: Optional[ExecHost] = Field("local", description="Execution host")
     security: Optional[ExecSecurity] = Field("full", description="deny|allowlist|full")
     ask: Optional[ExecAsk] = Field("on-miss", description="off|on-miss|always")
@@ -537,6 +568,7 @@ class ExecTool(BaseTool):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name != "nt"),
         )
 
         session_id = uuid.uuid4().hex[:12]
@@ -553,7 +585,7 @@ class ExecTool(BaseTool):
             if params.stdin_data is not None:
                 proc.stdin.write(params.stdin_data.encode())
                 await proc.stdin.drain()
-            if params.stdin_eof:
+            if params.stdin_eof or not (params.interactive or False):
                 proc.stdin.close()
 
         async def pump(stream: Optional[asyncio.StreamReader], sink: Callable[[str], None]) -> None:
@@ -574,8 +606,11 @@ class ExecTool(BaseTool):
                 try:
                     await asyncio.wait_for(proc.wait(), timeout=float(params.timeout_sec or 0))
                 except asyncio.TimeoutError:
-                    proc.kill()
-                    await proc.wait()
+                    _kill_process_tree(int(proc.pid or 0))
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except Exception:
+                        pass
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             finally:
                 session.exited = True
@@ -679,17 +714,20 @@ class ProcessTool(BaseTool):
             return {"status": "completed", "session_id": s.session_id, "text": sliced}
 
         if params.action == "write":
-            if s.process.stdin is None:
+            if s.process.stdin is None or s.process.stdin.is_closing():
                 return {"status": "failed", "reason": "stdin unavailable"}
             data = params.data or ""
             if params.newline:
                 if not data.endswith("\n"):
                     data += "\n"
-            s.process.stdin.write(data.encode())
-            await s.process.stdin.drain()
-            if params.eof:
-                s.process.stdin.close()
-            return {"status": "completed", "session_id": s.session_id}
+            try:
+                s.process.stdin.write(data.encode())
+                await s.process.stdin.drain()
+                if params.eof:
+                    s.process.stdin.close()
+                return {"status": "completed", "session_id": s.session_id}
+            except Exception:
+                return {"status": "failed", "reason": "stdin write failed", "session_id": s.session_id}
 
         if params.action == "kill":
             if not s.exited:

@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -938,6 +939,8 @@ def run_cli(
     cwd: str | None = None,
     encoding: str = "utf-8",
     stream: bool = False,
+    stdin_data: str | None = None,
+    stdin_eof: bool = True,
 ) -> str:
     """Run a CLI command from within the agent work directory."""
     if not command or not command.strip():
@@ -992,35 +995,101 @@ def run_cli(
         cmd = ["bash", "-lc", command]
 
     env = sanitize_exec_env(dict(os.environ))
+    stdin_spec = subprocess.DEVNULL if stdin_data is None else subprocess.PIPE
+
+    def _kill_process_tree(pid: int) -> None:
+        if pid <= 0:
+            return
+        if os.name == "nt":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=10,
+                    check=False,
+                )
+            except Exception:
+                pass
+            return
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except Exception:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except Exception:
+                pass
 
     try:
         if not stream:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 cmd,
                 cwd=str(resolved_cwd),
-                capture_output=True,
+                stdin=stdin_spec,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 env=env,
                 text=True,
                 encoding=encoding,
                 errors="replace",
-                timeout=timeout_s,
-                check=False,
+                start_new_session=(os.name != "nt"),
             )
-            stdout = completed.stdout or ""
-            stderr = completed.stderr or ""
-            exit_code = completed.returncode
+            try:
+                stdout, stderr = process.communicate(input=stdin_data, timeout=timeout_s)
+                exit_code = process.returncode
+            except subprocess.TimeoutExpired:
+                pid = int(process.pid or 0)
+                _kill_process_tree(pid)
+                try:
+                    process.wait(timeout=5)
+                except Exception:
+                    pass
+                try:
+                    stdout, stderr = process.communicate(timeout=2)
+                except Exception:
+                    stdout = ""
+                    stderr = ""
+                exit_code = 124
+                _log_action(
+                    {
+                        "kind": "run_cli",
+                        "ok": False,
+                        "command": command,
+                        "cwd": resolved_cwd.as_posix(),
+                        "exit_code": exit_code,
+                        "timeout_s": timeout_s,
+                        "ts": time.time(),
+                    }
+                )
+                tail = "\n".join((stdout or "").splitlines()[-40:])
+                return "\n".join([f"Command timed out after {timeout_s}s.", "stdout_tail:", tail]).rstrip()
         else:
             console_print(f"$ {command}", flush=True, ensure_newline=True)
             process = subprocess.Popen(
                 cmd,
                 cwd=str(resolved_cwd),
+                stdin=stdin_spec,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 env=env,
                 text=True,
                 encoding=encoding,
                 errors="replace",
+                start_new_session=(os.name != "nt"),
             )
+            if stdin_data is not None and process.stdin is not None:
+                try:
+                    process.stdin.write(stdin_data)
+                    process.stdin.flush()
+                except OSError:
+                    pass
+                if stdin_eof:
+                    try:
+                        process.stdin.close()
+                    except OSError:
+                        pass
 
             output_lines: list[str] = []
             output_lock = threading.Lock()
@@ -1041,18 +1110,12 @@ def run_cli(
                 exit_code = process.wait(timeout=timeout_s)
             except subprocess.TimeoutExpired:
                 timed_out = True
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
+                pid = int(process.pid or 0)
+                _kill_process_tree(pid)
                 try:
                     exit_code = process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                    exit_code = process.wait(timeout=5)
+                except Exception:
+                    exit_code = 124
 
             t.join(timeout=2)
             try:
@@ -1076,7 +1139,8 @@ def run_cli(
                         "ts": time.time(),
                     }
                 )
-                return f"Command timed out after {timeout_s}s."
+                tail = "\n".join((stdout or "").splitlines()[-40:])
+                return "\n".join([f"Command timed out after {timeout_s}s.", "stdout_tail:", tail]).rstrip()
     except FileNotFoundError as e:
         _log_action(
             {
@@ -1089,19 +1153,6 @@ def run_cli(
             }
         )
         return f"Shell not found: {e}"
-    except subprocess.TimeoutExpired:
-        _log_action(
-            {
-                "kind": "run_cli",
-                "ok": False,
-                "command": command,
-                "cwd": resolved_cwd.as_posix(),
-                "error": f"Command timed out after {timeout_s}s.",
-                "timeout_s": timeout_s,
-                "ts": time.time(),
-            }
-        )
-        return f"Command timed out after {timeout_s}s."
     except OSError as e:
         _log_action(
             {
@@ -1134,6 +1185,7 @@ def run_cli(
     return "\n".join(
         [
             f"cwd: {resolved_cwd.as_posix()}",
+            f"ok: {str(exit_code == 0).lower()}",
             f"exit_code: {exit_code}",
             "stdout:",
             stdout.rstrip(),

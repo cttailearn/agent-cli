@@ -6,6 +6,9 @@ import time
 from pathlib import Path
 
 
+CORE_SKILLS: frozenset[str] = frozenset({"find-skills", "skill-creator"})
+
+
 def _project_root() -> Path:
     root = os.environ.get("AGENT_PROJECT_DIR")
     if root:
@@ -15,6 +18,10 @@ def _project_root() -> Path:
 
 def _state_path() -> Path:
     return (_project_root() / ".agents" / "skills_state.json").resolve()
+
+
+def state_path() -> Path:
+    return _state_path()
 
 
 def load_state() -> dict[str, object]:
@@ -49,6 +56,8 @@ def is_disabled(name: str) -> bool:
     n = (name or "").strip()
     if not n:
         return False
+    if n in CORE_SKILLS:
+        return False
     state = load_state()
     disabled = state.get("disabled")
     return isinstance(disabled, dict) and n in disabled
@@ -57,6 +66,8 @@ def is_disabled(name: str) -> bool:
 def disable_skill(name: str, reason: str = "") -> None:
     n = (name or "").strip()
     if not n:
+        return
+    if n in CORE_SKILLS:
         return
     state = load_state()
     disabled = state.get("disabled")

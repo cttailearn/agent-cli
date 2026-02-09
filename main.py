@@ -125,25 +125,25 @@ def main() -> None:
             p = p.resolve()
         return p
 
+    def _assert_under_project(p: Path, label: str) -> Path:
+        resolved = p.resolve()
+        try:
+            resolved.relative_to(project_root)
+        except ValueError:
+            raise RuntimeError(f"{label} must be under project_dir: {resolved.as_posix()}")
+        return resolved
+
     skills_dirs: list[Path] = []
 
     skills_dirs_raw = (args.skills_dirs or "").strip()
     if skills_dirs_raw:
         parts = [s.strip() for s in re.split(r"[;,]+", skills_dirs_raw) if s.strip()]
-        skills_dirs.extend([_resolve_dir(project_root, s) for s in parts])
+        skills_dirs.extend([_assert_under_project(_resolve_dir(project_root, s), "skills_dirs") for s in parts])
 
-    project_skills_dir = _resolve_dir(project_root, args.skills_dir)
+    project_skills_dir = _assert_under_project(_resolve_dir(project_root, args.skills_dir), "skills_dir")
     if project_skills_dir not in {p.resolve() for p in skills_dirs}:
         skills_dirs.insert(0, project_skills_dir)
     project_skills_dir.mkdir(parents=True, exist_ok=True)
-
-    built_in_skills_dir = (script_root / "skills").resolve()
-    if built_in_skills_dir.exists() and built_in_skills_dir not in {p.resolve() for p in skills_dirs}:
-        skills_dirs.append(built_in_skills_dir)
-
-    global_skills_dir = (Path.home() / ".agents" / "skills").resolve()
-    if global_skills_dir.exists() and global_skills_dir not in {p.resolve() for p in skills_dirs}:
-        skills_dirs.append(global_skills_dir)
 
     def _build_agent() -> tuple[object, CliState]:
         agent, catalog, count = build_agent(

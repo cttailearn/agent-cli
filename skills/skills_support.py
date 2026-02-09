@@ -115,6 +115,12 @@ def build_skill_catalog_text(manifests: list[SkillManifest]) -> str:
 
 def _compute_skill_fingerprint(skills_dirs: Iterable[Path]) -> tuple[tuple[str, int, int], ...]:
     entries: list[tuple[str, int, int]] = []
+    state_path = skills_state.state_path()
+    try:
+        st = state_path.stat()
+        entries.append((state_path.as_posix(), st.st_mtime_ns, st.st_size))
+    except OSError:
+        entries.append((state_path.as_posix(), 0, 0))
     for skills_dir in skills_dirs:
         if not skills_dir.exists():
             continue
