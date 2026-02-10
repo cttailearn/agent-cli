@@ -5,9 +5,10 @@ import re
 from pathlib import Path
 
 from .storage import KnowledgeGraphStore
+from .storage import PageIndexStore
 
 
-_TOKEN_RE = re.compile(r"[\\w\\u4e00-\\u9fff]+", re.UNICODE)
+_TOKEN_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
 
 
 def _tokens(s: str) -> list[str]:
@@ -117,3 +118,97 @@ def graph_stats(store: KnowledgeGraphStore) -> str:
         d = len(docs) if isinstance(docs, dict) else 0
     return f"nodes={n} edges={e} documents={d}"
 
+
+def _pageindex_node_text(node: dict[str, object]) -> str:
+    parts: list[str] = []
+    for k in ("title", "summary", "text", "content", "name"):
+        v = node.get(k)
+        if isinstance(v, str) and v:
+            parts.append(v)
+    return " ".join(parts).lower()
+
+
+def _walk_pageindex(
+    nodes: object,
+    *,
+    path: tuple[str, ...] = (),
+) -> list[tuple[tuple[str, ...], dict[str, object]]]:
+    out: list[tuple[tuple[str, ...], dict[str, object]]] = []
+    if isinstance(nodes, dict):
+        title = nodes.get("title") if isinstance(nodes.get("title"), str) else ""
+        p = path + ((title or "").strip(),) if (title or "").strip() else path
+        out.append((p, nodes))
+        children = nodes.get("nodes")
+        if isinstance(children, list):
+            for c in children:
+                out.extend(_walk_pageindex(c, path=p))
+        return out
+    if isinstance(nodes, list):
+        for n in nodes:
+            out.extend(_walk_pageindex(n, path=path))
+    return out
+
+
+def search_pageindex(
+    store: PageIndexStore,
+    query: str,
+    *,
+    limit: int = 12,
+    namespace_prefix: tuple[str, ...] | None = None,
+) -> str:
+    q = (query or "").strip()
+    if not q:
+        return ""
+    toks = _tokens(q)
+    if not toks:
+        return ""
+    lim = max(1, min(50, int(limit or 12)))
+    prefix = namespace_prefix if isinstance(namespace_prefix, tuple) else tuple(namespace_prefix or ()) if namespace_prefix is not None else None
+    namespaces = store.list_namespaces(prefix=prefix, limit=5000)
+    scored: list[tuple[float, tuple[str, ...], str, tuple[str, ...], dict[str, object]]] = []
+    for ns in namespaces:
+        for key, _ in store.iter_docs(ns):
+            doc = store.get(ns, key)
+            if not isinstance(doc, dict):
+                continue
+            structure = doc.get("structure")
+            nodes = _walk_pageindex(structure, path=())
+            if not nodes:
+                continue
+            meta = doc.get("meta")
+            meta_dict = meta if isinstance(meta, dict) else {}
+            for node_path, node in nodes:
+                text = _pageindex_node_text(node)
+                if not text:
+                    continue
+                hit = 0
+                for t in toks:
+                    if t in text:
+                        hit += 1
+                if hit <= 0:
+                    continue
+                score = hit / max(1.0, math.sqrt(len(text)))
+                scored.append((score, ns, key, node_path, meta_dict))
+    if not scored:
+        return ""
+    scored.sort(key=lambda x: x[0], reverse=True)
+    out: list[str] = []
+    for score, ns, key, node_path, meta in scored[:lim]:
+        path_text = " / ".join([p for p in node_path if p])
+        where = "/".join(list(ns) + [key])
+        src = meta.get("source_path") if isinstance(meta.get("source_path"), str) else ""
+        updated = meta.get("updated_at") if isinstance(meta.get("updated_at"), str) else ""
+        suffix = []
+        if updated:
+            suffix.append(updated)
+        if src:
+            suffix.append(Path(src).name)
+        tail = f" ({', '.join(suffix)})" if suffix else ""
+        out.append(f"- {where} :: {path_text} score={score:.3f}{tail}".strip())
+    return "\n".join(out).strip()
+
+
+def pageindex_stats(store: PageIndexStore, *, prefix: tuple[str, ...] | None = None) -> str:
+    pre = prefix if isinstance(prefix, tuple) else tuple(prefix or ()) if prefix is not None else None
+    s = store.stats(prefix=pre)
+    return f"namespaces={s.get('namespaces', 0)} docs={s.get('docs', 0)} nodes={s.get('nodes', 0)}"

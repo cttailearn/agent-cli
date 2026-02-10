@@ -40,3 +40,12 @@ class DailyAtSchedule(Schedule):
 class ManualSchedule(Schedule):
     def next_run_ts(self, *, now_ts: float) -> float | None:
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class OneShotSchedule(Schedule):
+    run_ts: float
+
+    def next_run_ts(self, *, now_ts: float) -> float | None:
+        t = float(self.run_ts)
+        return t if t > now_ts else None

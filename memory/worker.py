@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import re
@@ -344,5 +345,110 @@ class KnowledgeGraphWorker:
                 continue
             try:
                 ingest_chat_markdown(model=model, store=self.kg_store, path=p)
+            except Exception:
+                continue
+
+
+class PageIndexWorker:
+    def __init__(self, *, store, default_namespace: tuple[str, ...] = ()) -> None:
+        self.store = store
+        self.default_namespace = default_namespace
+        self._q: queue.Queue[Path] = queue.Queue()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="PageIndexWorker", daemon=True)
+        self._thread.start()
+
+    def stop(self, *, flush: bool) -> None:
+        if flush:
+            deadline = time.time() + 8.0
+            while not self._q.empty() and time.time() < deadline:
+                time.sleep(0.05)
+        self._stop.set()
+        try:
+            self._q.put_nowait(Path())
+        except Exception:
+            pass
+        if self._thread is not None:
+            self._thread.join(timeout=3.0)
+
+    def enqueue(self, path: Path) -> None:
+        try:
+            self._q.put_nowait(path)
+        except Exception:
+            pass
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            try:
+                p = self._q.get(timeout=0.25)
+            except Exception:
+                continue
+            if not isinstance(p, Path) or not p.as_posix():
+                continue
+            src = p.resolve()
+            if not src.exists() or not src.is_file():
+                continue
+            try:
+                from memory.pageindex.page_index_md import md_to_tree
+                from memory.pageindex.utils import ConfigLoader
+            except Exception:
+                continue
+
+            day = ""
+            parts = src.parts
+            for part in parts:
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", part):
+                    day = part
+                    break
+            ns = tuple(self.default_namespace + (day,)) if day else tuple(self.default_namespace)
+            key = src.stem
+            try:
+                opt = ConfigLoader().load()
+                try:
+                    tree = asyncio.run(
+                        md_to_tree(
+                            md_path=src.as_posix(),
+                            if_thinning=False,
+                            min_token_threshold=None,
+                            if_add_node_summary=str(getattr(opt, "if_add_node_summary", "yes")),
+                            summary_token_threshold=200,
+                            model=str(getattr(opt, "model", "")),
+                            if_add_doc_description=str(getattr(opt, "if_add_doc_description", "no")),
+                            if_add_node_text=str(getattr(opt, "if_add_node_text", "no")),
+                            if_add_node_id=str(getattr(opt, "if_add_node_id", "yes")),
+                        )
+                    )
+                except Exception:
+                    tree = asyncio.run(
+                        md_to_tree(
+                            md_path=src.as_posix(),
+                            if_thinning=False,
+                            min_token_threshold=None,
+                            if_add_node_summary="no",
+                            summary_token_threshold=200,
+                            model=str(getattr(opt, "model", "")),
+                            if_add_doc_description="no",
+                            if_add_node_text="yes",
+                            if_add_node_id=str(getattr(opt, "if_add_node_id", "yes")),
+                        )
+                    )
+                if not isinstance(tree, dict):
+                    tree = {"doc_name": src.stem, "structure": []}
+                meta = tree.get("meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                t = time.time()
+                meta.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t)))
+                meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+                meta["source_path"] = src.as_posix()
+                meta["source_type"] = "markdown"
+                tree["meta"] = meta
+                self.store.put(ns, key, tree)
             except Exception:
                 continue

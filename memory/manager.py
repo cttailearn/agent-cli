@@ -3,26 +3,35 @@ from __future__ import annotations
 import threading
 import time
 import uuid
+import os
 from pathlib import Path
 
 from langchain.agents.middleware.types import AgentMiddleware, ModelRequest
 from langchain_core.messages import SystemMessage
 
 from . import paths
-from .storage import ChatLogStore, KnowledgeGraphStore
-from .worker import KnowledgeGraphWorker
+from .storage import ChatLogStore, PageIndexStore
+from .worker import PageIndexWorker
 
 
 def ensure_memory_scaffold(project_root: Path) -> dict[str, str]:
     root = paths.memory_root(project_root)
     core = paths.core_dir(project_root)
     chats = paths.chats_dir(project_root)
-    kg = paths.kg_dir(project_root)
+    pi = paths.pageindex_dir(project_root)
+    pi_chats = paths.pageindex_chats_dir(project_root)
+    pi_ltm = paths.pageindex_ltm_dir(project_root)
+    pi_docs = paths.pageindex_docs_dir(project_root)
+    episodic_dir = paths.langgraph_store_path(project_root).parent
 
     root.mkdir(parents=True, exist_ok=True)
     core.mkdir(parents=True, exist_ok=True)
     chats.mkdir(parents=True, exist_ok=True)
-    kg.mkdir(parents=True, exist_ok=True)
+    pi.mkdir(parents=True, exist_ok=True)
+    pi_chats.mkdir(parents=True, exist_ok=True)
+    pi_ltm.mkdir(parents=True, exist_ok=True)
+    pi_docs.mkdir(parents=True, exist_ok=True)
+    episodic_dir.mkdir(parents=True, exist_ok=True)
 
     created: dict[str, str] = {}
     defaults: dict[str, str] = {
@@ -209,11 +218,8 @@ class MemoryManager:
         self._turn = 0
         self._lock = threading.Lock()
         self.chat_store = ChatLogStore(chats_dir=paths.chats_dir(self.project_root), session_id=self.session_id)
-        self.kg_store = KnowledgeGraphStore(graph_path=paths.graph_path(self.project_root))
-        self.worker = KnowledgeGraphWorker(
-            model_name=self.model_name,
-            kg_store=self.kg_store,
-        )
+        self.pageindex_store = PageIndexStore(root_dir=paths.pageindex_chats_dir(self.project_root))
+        self.worker = PageIndexWorker(store=self.pageindex_store, default_namespace=())
 
     def start(self) -> None:
         self.worker.start()
@@ -230,5 +236,7 @@ class MemoryManager:
             self._turn += 1
             turn = self._turn
         path = self.chat_store.write_turn(turn=turn, user_text=u, assistant_text=a)
-        self.worker.enqueue(path)
+        realtime = (os.environ.get("AGENT_PAGEINDEX_REALTIME") or "").strip().lower()
+        if realtime in {"1", "true", "yes", "on"}:
+            self.worker.enqueue(path)
         return path

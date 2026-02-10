@@ -289,3 +289,167 @@ class PersistentInMemoryStore:
                 return res
 
         return _wrapped
+
+    def snapshot_items(self, namespace: tuple[str, ...]) -> list[dict[str, object]]:
+        from langgraph.store.base import Item
+
+        ns = namespace if isinstance(namespace, tuple) else tuple(namespace or ())
+        out: list[dict[str, object]] = []
+        with self._lock:
+            data = getattr(self._store, "_data", None)
+            if not isinstance(data, dict):
+                return out
+            ns_items = data.get(ns)
+            if not isinstance(ns_items, dict):
+                return out
+            for key, item in ns_items.items():
+                if not isinstance(key, str) or not key:
+                    continue
+                if not isinstance(item, Item):
+                    continue
+                val = getattr(item, "value", None)
+                if not isinstance(val, dict):
+                    continue
+                out.append(
+                    {
+                        "namespace": list(getattr(item, "namespace", ()) or ()),
+                        "key": getattr(item, "key", ""),
+                        "created_at": getattr(item, "created_at", ""),
+                        "updated_at": getattr(item, "updated_at", ""),
+                        "value": val,
+                    }
+                )
+        return out
+
+
+def _safe_component(name: str) -> str:
+    raw = (name or "").strip()
+    if not raw:
+        return "default"
+    out = []
+    for ch in raw:
+        if ch.isalnum() or ch in {"-", "_", "."}:
+            out.append(ch)
+        else:
+            out.append("_")
+    s = "".join(out).strip("._-")
+    return s[:160] if s else "default"
+
+
+class PageIndexStore:
+    def __init__(self, *, root_dir: Path) -> None:
+        self.root_dir = root_dir.resolve()
+        self._lock = threading.RLock()
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+
+    def _ns_dir(self, namespace: tuple[str, ...]) -> Path:
+        ns = namespace if isinstance(namespace, tuple) else tuple(namespace or ())
+        p = self.root_dir
+        for part in ns:
+            p = p / _safe_component(str(part))
+        return p.resolve()
+
+    def _doc_path(self, namespace: tuple[str, ...], key: str) -> Path:
+        k = _safe_component(key)
+        return (self._ns_dir(namespace) / f"{k}.json").resolve()
+
+    def put(self, namespace: tuple[str, ...], key: str, value: dict[str, object]) -> None:
+        k = (key or "").strip()
+        if not k:
+            raise ValueError("Missing key.")
+        if not isinstance(value, dict):
+            raise TypeError("value must be a dict")
+        p = self._doc_path(namespace, k)
+        payload = dict(value)
+        with self._lock:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(p.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8", errors="replace")
+            os.replace(tmp, p)
+
+    def get(self, namespace: tuple[str, ...], key: str) -> dict[str, object] | None:
+        k = (key or "").strip()
+        if not k:
+            return None
+        p = self._doc_path(namespace, k)
+        with self._lock:
+            if not p.exists() or not p.is_file():
+                return None
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+            except Exception:
+                return None
+        return raw if isinstance(raw, dict) else None
+
+    def delete(self, namespace: tuple[str, ...], key: str) -> None:
+        k = (key or "").strip()
+        if not k:
+            return
+        p = self._doc_path(namespace, k)
+        with self._lock:
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+
+    def iter_docs(self, namespace: tuple[str, ...]) -> list[tuple[str, Path]]:
+        d = self._ns_dir(namespace)
+        with self._lock:
+            if not d.exists() or not d.is_dir():
+                return []
+            out: list[tuple[str, Path]] = []
+            for p in sorted(d.glob("*.json")):
+                if not p.is_file():
+                    continue
+                out.append((p.stem, p.resolve()))
+            return out
+
+    def list_namespaces(self, prefix: tuple[str, ...] | None = None, limit: int = 200) -> list[tuple[str, ...]]:
+        pre = prefix if isinstance(prefix, tuple) else tuple(prefix or ()) if prefix is not None else ()
+        base = self._ns_dir(pre) if pre else self.root_dir
+        out: list[tuple[str, ...]] = []
+        with self._lock:
+            if not base.exists() or not base.is_dir():
+                return out
+            for dirpath, dirnames, filenames in os.walk(base):
+                if len(out) >= max(1, int(limit or 200)):
+                    break
+                if any(f.endswith(".json") for f in filenames):
+                    rel = Path(dirpath).resolve().relative_to(self.root_dir)
+                    parts = tuple([p for p in rel.as_posix().split("/") if p])
+                    ns = tuple(pre + parts) if pre else parts
+                    out.append(ns)
+            out.sort()
+        return out
+
+    def stats(self, prefix: tuple[str, ...] | None = None) -> dict[str, int]:
+        namespaces = self.list_namespaces(prefix=prefix, limit=10_000)
+        doc_count = 0
+        node_count = 0
+        for ns in namespaces:
+            for _, p in self.iter_docs(ns):
+                doc_count += 1
+                try:
+                    raw = json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+                except Exception:
+                    continue
+                if not isinstance(raw, dict):
+                    continue
+                structure = raw.get("structure")
+                if isinstance(structure, list):
+                    node_count += _count_pageindex_nodes(structure)
+        return {"namespaces": len(namespaces), "docs": doc_count, "nodes": node_count}
+
+
+def _count_pageindex_nodes(structure: object) -> int:
+    if isinstance(structure, dict):
+        n = 1
+        nodes = structure.get("nodes")
+        if isinstance(nodes, list):
+            for c in nodes:
+                n += _count_pageindex_nodes(c)
+        return n
+    if isinstance(structure, list):
+        return sum(_count_pageindex_nodes(x) for x in structure)
+    return 0

@@ -9,6 +9,7 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from datetime import date, datetime, timedelta, timezone
 from fnmatch import fnmatch
 from langchain_core.tools import tool
 from pathlib import Path
@@ -145,7 +146,8 @@ def _project_root() -> Path:
     project_dir_env = os.environ.get("AGENT_PROJECT_DIR")
     if project_dir_env:
         return Path(project_dir_env).expanduser()
-    return Path(__file__).resolve().parent
+    repo_root = Path(__file__).resolve().parent.parent
+    return (repo_root / "workspace").resolve()
 
 
 def _resolve_under_root(root: Path, path: str) -> tuple[Path | None, str | None]:
@@ -1482,11 +1484,11 @@ def memory_core_write(kind: str, content: str) -> str:
 
 @tool
 def memory_kg_recall(query: str, limit: int = 12) -> str:
-    """Search the knowledge graph built from chat logs."""
+    """Search the pageindex built from chat logs."""
     try:
-        from memory.paths import graph_path
-        from memory.query import search_graph
-        from memory.storage import KnowledgeGraphStore
+        from memory.paths import pageindex_chats_dir
+        from memory.query import search_pageindex
+        from memory.storage import PageIndexStore
     except Exception as e:
         return f"Import failed: {e}"
     q = (query or "").strip()
@@ -1495,21 +1497,129 @@ def memory_kg_recall(query: str, limit: int = 12) -> str:
     if limit <= 0:
         limit = 12
     limit = max(1, min(50, int(limit)))
-    store = KnowledgeGraphStore(graph_path=graph_path(_memory_project_root()))
-    return search_graph(store, q, limit=limit)
+    store = PageIndexStore(root_dir=pageindex_chats_dir(_memory_project_root()))
+    return search_pageindex(store, q, limit=limit)
 
 
 @tool
 def memory_kg_stats() -> str:
-    """Show knowledge graph size info."""
+    """Show pageindex size info."""
     try:
-        from memory.paths import graph_path
-        from memory.query import graph_stats
-        from memory.storage import KnowledgeGraphStore
+        from memory.paths import pageindex_chats_dir
+        from memory.query import pageindex_stats
+        from memory.storage import PageIndexStore
     except Exception as e:
         return f"Import failed: {e}"
-    store = KnowledgeGraphStore(graph_path=graph_path(_memory_project_root()))
-    return graph_stats(store)
+    store = PageIndexStore(root_dir=pageindex_chats_dir(_memory_project_root()))
+    return pageindex_stats(store)
+
+
+@tool
+def memory_pageindex_ingest(path: str, namespace: str = "default", key: str = "") -> str:
+    """Ingest a local PDF/Markdown file into PageIndex JSON store."""
+    try:
+        from memory.paths import pageindex_docs_dir
+        from memory.storage import PageIndexStore
+        from memory.pageindex.page_index_md import md_to_tree
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = Path((path or "").strip()).resolve()
+    if not p.exists() or not p.is_file():
+        return "File not found."
+    today = time.strftime("%Y-%m-%d", time.localtime())
+    uploads_raw = (os.environ.get("AGENT_UPLOADS_DIR") or "").strip() or "memory/uploads"
+    uploads_base = Path(uploads_raw).expanduser()
+    if not uploads_base.is_absolute():
+        uploads_base = (_memory_project_root() / uploads_base).resolve()
+    else:
+        uploads_base = uploads_base.resolve()
+    uploads_root = (uploads_base / today).resolve()
+    uploads_root.mkdir(parents=True, exist_ok=True)
+    dst = (uploads_root / p.name).resolve()
+    try:
+        if dst != p:
+            dst.write_bytes(p.read_bytes())
+    except Exception:
+        dst = p
+
+    ns = _parse_namespace(namespace, default=("default", today))
+    k = (key or "").strip() or dst.stem
+    store = PageIndexStore(root_dir=pageindex_docs_dir(_memory_project_root()))
+    suffix = dst.suffix.lower()
+    now = time.time()
+
+    defer = (os.environ.get("AGENT_PAGEINDEX_DAILY_ENABLE") or "").strip().lower() in {"1", "true", "yes", "on"}
+    realtime = (os.environ.get("AGENT_PAGEINDEX_REALTIME") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if defer and not realtime:
+        return f"Saved: {dst.as_posix()}"
+
+    if suffix == ".pdf":
+        try:
+            from memory.pageindex.page_index import page_index
+        except Exception as e:
+            return f"Import failed: {e}"
+        try:
+            doc = page_index(dst.as_posix())
+        except Exception as e:
+            return f"Ingest failed: {e}"
+        if not isinstance(doc, dict):
+            doc = {"doc_name": dst.stem, "structure": []}
+    elif suffix in {".md", ".markdown"}:
+        try:
+            try:
+                doc = asyncio.run(
+                    md_to_tree(
+                        md_path=dst.as_posix(),
+                        if_thinning=False,
+                        if_add_node_summary="yes",
+                        if_add_node_text="yes",
+                        model=None,
+                    )
+                )
+            except Exception:
+                doc = asyncio.run(
+                    md_to_tree(
+                        md_path=dst.as_posix(),
+                        if_thinning=False,
+                        if_add_node_summary="no",
+                        if_add_node_text="yes",
+                        model=None,
+                    )
+                )
+        except Exception as e:
+            return f"Ingest failed: {e}"
+        if not isinstance(doc, dict):
+            doc = {"doc_name": dst.stem, "structure": []}
+    else:
+        return "Unsupported file type. Use .pdf or .md."
+    meta = doc.get("meta")
+    if not isinstance(meta, dict):
+        meta = {}
+    meta.setdefault("created_at", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)))
+    meta["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
+    meta["source_path"] = dst.as_posix()
+    meta["source_type"] = "pdf" if suffix == ".pdf" else "markdown"
+    doc["meta"] = meta
+    store.put(ns, k, doc)
+    return "OK"
+
+
+@tool
+def memory_pageindex_search(query: str, namespace_prefix: str = "", limit: int = 12) -> str:
+    """Search PageIndex docs store (PDF/Markdown ingested documents)."""
+    try:
+        from memory.paths import pageindex_docs_dir
+        from memory.query import search_pageindex
+        from memory.storage import PageIndexStore
+    except Exception as e:
+        return f"Import failed: {e}"
+    q = (query or "").strip()
+    if not q:
+        return ""
+    lim = max(1, min(50, int(limit or 12)))
+    pre = _parse_namespace(namespace_prefix, default=())
+    store = PageIndexStore(root_dir=pageindex_docs_dir(_memory_project_root()))
+    return search_pageindex(store, q, limit=lim, namespace_prefix=pre if pre else None)
 
 
 @tool
@@ -1566,55 +1676,411 @@ def _parse_namespace(namespace: str, *, default: tuple[str, ...] = ("default",))
     return tuple(parts) if parts else default
 
 
+_LTM_TOKEN_RE = re.compile(r"[\w\u4e00-\u9fff]+", re.UNICODE)
+_LTM_STOPWORDS = {
+    "昨天",
+    "今天",
+    "前天",
+    "回忆",
+    "回想",
+    "记得",
+    "内容",
+    "事情",
+    "一下",
+    "帮我",
+    "请",
+    "需要",
+    "想",
+    "问题",
+    "怎么",
+    "如何",
+    "什么",
+    "以及",
+    "然后",
+    "进行",
+    "先",
+    "再",
+    "最后",
+    "定位",
+    "功能",
+    "实现",
+    "优化",
+    "长期",
+    "记忆",
+    "智能体",
+}
+
+
+def _utc_iso(ts: float | None = None) -> str:
+    t = time.gmtime(ts if ts is not None else time.time())
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", t)
+
+
+def _local_date_str(ts: float | None = None) -> str:
+    t = time.localtime(ts if ts is not None else time.time())
+    return time.strftime("%Y-%m-%d", t)
+
+
+def _extract_keywords(text: str, *, limit: int = 12) -> list[str]:
+    raw = (text or "").strip().lower()
+    if not raw:
+        return []
+    toks: list[str] = []
+    for m in _LTM_TOKEN_RE.finditer(raw):
+        tok = (m.group(0) or "").strip()
+        if not tok:
+            continue
+        if tok in _LTM_STOPWORDS:
+            continue
+        if tok.isascii():
+            if len(tok) < 3:
+                continue
+        else:
+            if len(tok) < 2:
+                continue
+        toks.append(tok)
+        if len(toks) >= max(1, min(50, int(limit or 12))):
+            break
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in toks:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
+
+
+def _merge_ltm_meta(
+    existing: dict[str, object] | None,
+    *,
+    now_ts: float,
+    thread_id: str,
+    keywords: list[str],
+) -> dict[str, object]:
+    meta = existing if isinstance(existing, dict) else {}
+    created_at = meta.get("created_at")
+    created_ts = meta.get("created_ts")
+    created_date = meta.get("created_date")
+    if not isinstance(created_at, str) or not created_at:
+        meta["created_at"] = _utc_iso(now_ts)
+    if not isinstance(created_ts, (int, float)):
+        meta["created_ts"] = float(now_ts)
+    if not isinstance(created_date, str) or not created_date:
+        meta["created_date"] = _local_date_str(now_ts)
+    meta["updated_at"] = _utc_iso(now_ts)
+    meta["updated_ts"] = float(now_ts)
+    meta["updated_date"] = _local_date_str(now_ts)
+    if thread_id:
+        meta["thread_id"] = thread_id
+
+    merged_keywords: list[str] = []
+    existing_kw = meta.get("keywords")
+    if isinstance(existing_kw, list):
+        for k in existing_kw:
+            if isinstance(k, str) and k.strip():
+                merged_keywords.append(k.strip().lower())
+    for k in keywords:
+        if isinstance(k, str) and k.strip():
+            merged_keywords.append(k.strip().lower())
+    seen: set[str] = set()
+    out_kw: list[str] = []
+    for k in merged_keywords:
+        if k in seen:
+            continue
+        seen.add(k)
+        out_kw.append(k)
+        if len(out_kw) >= 50:
+            break
+    if out_kw:
+        meta["keywords"] = out_kw
+    return meta
+
+
+def _parse_date_str(s: str) -> date | None:
+    raw = (s or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("/", "-").replace(".", "-")
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", raw)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(\d{4})年(\d{1,2})月(\d{1,2})日?", raw)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m = re.search(r"(?<!\d)(\d{1,2})月(\d{1,2})日?(?!\d)", raw)
+    if m:
+        y = date.today().year
+        try:
+            return date(int(y), int(m.group(1)), int(m.group(2)))
+        except ValueError:
+            return None
+    return None
+
+
+def _infer_date_window(query: str, filt: dict[str, object] | None) -> tuple[date | None, date | None]:
+    f = filt if isinstance(filt, dict) else {}
+    if isinstance(f.get("date"), str):
+        d = _parse_date_str(f.get("date") or "")
+        if d:
+            return d, d
+    if isinstance(f.get("start_date"), str) or isinstance(f.get("end_date"), str):
+        sd = _parse_date_str(f.get("start_date") or "")
+        ed = _parse_date_str(f.get("end_date") or "")
+        return sd, ed
+    days_ago = f.get("days_ago")
+    if isinstance(days_ago, (int, float)):
+        d = date.today() - timedelta(days=int(days_ago))
+        return d, d
+
+    q = (query or "").strip()
+    if not q:
+        return None, None
+    if "昨天" in q:
+        d = date.today() - timedelta(days=1)
+        return d, d
+    if "前天" in q:
+        d = date.today() - timedelta(days=2)
+        return d, d
+    if "今天" in q:
+        d = date.today()
+        return d, d
+    d = _parse_date_str(q)
+    if d:
+        return d, d
+    if "上周" in q or "最近7天" in q or "近7天" in q:
+        end = date.today()
+        start = end - timedelta(days=7)
+        return start, end
+    return None, None
+
+
+def _keywords_from_filter_or_query(query: str, filt: dict[str, object] | None) -> list[str]:
+    f = filt if isinstance(filt, dict) else {}
+    kws: list[str] = []
+    fk = f.get("keywords") or f.get("keyword") or f.get("tags") or f.get("tag")
+    if isinstance(fk, str) and fk.strip():
+        kws.extend([x.strip().lower() for x in re.split(r"[,\s]+", fk.strip()) if x.strip()])
+    elif isinstance(fk, list):
+        for x in fk:
+            if isinstance(x, str) and x.strip():
+                kws.append(x.strip().lower())
+    if not kws:
+        kws = _extract_keywords(query or "", limit=6)
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in kws:
+        kk = (k or "").strip().lower()
+        if not kk or kk in _LTM_STOPWORDS:
+            continue
+        if kk in seen:
+            continue
+        seen.add(kk)
+        out.append(kk)
+    return out[:12]
+
+
+def _safe_str_excerpt(s: str, *, limit: int = 220) -> str:
+    t = (s or "").strip()
+    if not t:
+        return ""
+    n = max(20, min(2000, int(limit or 220)))
+    if len(t) <= n:
+        return t
+    return t[:n].rstrip() + "…"
+
+
+def _ltm_snapshot_items(store: object, ns: tuple[str, ...]) -> list[dict[str, object]]:
+    snap_fn = getattr(store, "snapshot_items", None)
+    if callable(snap_fn):
+        try:
+            items = snap_fn(ns)
+            if isinstance(items, list):
+                return [x for x in items if isinstance(x, dict)]
+        except Exception:
+            pass
+    return []
+
+
+def _ltm_item_date(item: dict[str, object]) -> date | None:
+    val = item.get("value")
+    if isinstance(val, dict):
+        meta = val.get("meta")
+        if not isinstance(meta, dict):
+            meta = val.get("_meta") if isinstance(val.get("_meta"), dict) else {}
+        cd = meta.get("created_date")
+        if isinstance(cd, str):
+            d = _parse_date_str(cd)
+            if d:
+                return d
+    ca = item.get("created_at")
+    if isinstance(ca, str) and ca:
+        try:
+            return date.fromisoformat(ca[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _ltm_item_keywords(item: dict[str, object]) -> list[str]:
+    val = item.get("value")
+    if not isinstance(val, dict):
+        return []
+    meta = val.get("meta")
+    if not isinstance(meta, dict):
+        meta = val.get("_meta") if isinstance(val.get("_meta"), dict) else {}
+    kws: list[str] = []
+    if isinstance(meta, dict):
+        mk = meta.get("keywords")
+        if isinstance(mk, list):
+            for x in mk:
+                if isinstance(x, str) and x.strip():
+                    kws.append(x.strip().lower())
+    return kws
+
+
+def _ltm_item_text(item: dict[str, object]) -> str:
+    val = item.get("value")
+    if not isinstance(val, dict):
+        return ""
+    t = val.get("text")
+    return t if isinstance(t, str) else ""
+
+
+def _ltm_match_keywords(*, keywords: list[str], item_keywords: list[str], item_text: str) -> tuple[bool, int]:
+    if not keywords:
+        return True, 0
+    hits = 0
+    text = (item_text or "").lower()
+    kw_set = set(item_keywords or [])
+    for k in keywords:
+        if not k:
+            continue
+        ok = False
+        if k in kw_set:
+            ok = True
+            hits += 2
+        if not ok and k in text:
+            ok = True
+            hits += 1
+        if not ok:
+            return False, hits
+    return True, hits
+
+
 @tool
 def memory_ltm_put(namespace: str, key: str, value: dict[str, object], runtime: ToolRuntime) -> str:
-    """Store a long-term memory JSON document under (namespace, key)."""
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return "Store unavailable."
+    """Store a long-term memory item as a PageIndex JSON document under (namespace, key)."""
+    try:
+        from memory.paths import pageindex_ltm_dir
+        from memory.storage import PageIndexStore
+        from memory.pageindex.page_index_md import (
+            build_tree_from_nodes,
+            extract_node_text_content,
+            extract_nodes_from_markdown,
+            generate_summaries_for_structure_md,
+        )
+        from memory.pageindex.utils import ConfigLoader, format_structure, write_node_id
+    except Exception as e:
+        return f"Import failed: {e}"
+
     ns = _parse_namespace(namespace, default=("mem",))
     k = (key or "").strip()
     if not k:
         return "Missing key."
     v = value if isinstance(value, dict) else {}
-    if "text" not in v:
+
+    raw_text = v.get("text")
+    if not isinstance(raw_text, str) or not raw_text.strip():
         try:
-            v["text"] = json.dumps(v, ensure_ascii=False, sort_keys=True)
+            raw_text = json.dumps(v, ensure_ascii=False, sort_keys=True)
         except Exception:
-            v["text"] = str(v)
-    store.put(ns, k, v)
+            raw_text = str(v)
+    md = f"# {k}\n\n{raw_text.strip()}\n"
+
+    node_list, markdown_lines = extract_nodes_from_markdown(md)
+    nodes_with_content = extract_node_text_content(node_list, markdown_lines)
+    tree_structure = build_tree_from_nodes(nodes_with_content)
+
+    opt = ConfigLoader().load()
+    if str(getattr(opt, "if_add_node_id", "yes")) == "yes":
+        write_node_id(tree_structure)
+
+    tree_structure = format_structure(
+        tree_structure, order=["title", "node_id", "summary", "prefix_summary", "text", "line_num", "nodes"]
+    )
+    if str(getattr(opt, "if_add_node_summary", "yes")) == "yes":
+        summary_token_threshold = 200
+        try:
+            tree_structure = asyncio.run(
+                generate_summaries_for_structure_md(
+                    tree_structure,
+                    summary_token_threshold=summary_token_threshold,
+                    model=str(getattr(opt, "model", "")),
+                )
+            )
+        except Exception:
+            pass
+
+    now_ts = time.time()
+    keywords: list[str] = []
+    user_keywords = v.get("keywords")
+    if isinstance(user_keywords, list):
+        for kw in user_keywords:
+            if isinstance(kw, str) and kw.strip():
+                keywords.append(kw.strip().lower())
+    keywords.extend(_extract_keywords(raw_text))
+
+    thread_id = _runtime_thread_id(runtime)
+    meta_in = v.get("meta")
+    if not isinstance(meta_in, dict):
+        meta_in = v.get("_meta") if isinstance(v.get("_meta"), dict) else {}
+    meta = _merge_ltm_meta(meta_in, now_ts=now_ts, thread_id=thread_id, keywords=keywords)
+    meta["namespace"] = "/".join(ns)
+    meta["key"] = k
+
+    doc: dict[str, object] = {"doc_name": k, "structure": tree_structure, "meta": meta}
+    store = PageIndexStore(root_dir=pageindex_ltm_dir(_memory_project_root()))
+    store.put(ns, k, doc)
     return "OK"
 
 
 @tool
 def memory_ltm_get(namespace: str, key: str, runtime: ToolRuntime) -> str:
-    """Get a long-term memory JSON document by (namespace, key)."""
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return ""
+    """Get a long-term memory PageIndex JSON document by (namespace, key)."""
+    try:
+        from memory.paths import pageindex_ltm_dir
+        from memory.storage import PageIndexStore
+    except Exception as e:
+        return f"Import failed: {e}"
     ns = _parse_namespace(namespace, default=("mem",))
     k = (key or "").strip()
     if not k:
         return ""
-    item = store.get(ns, k)
-    if item is None:
-        return ""
-    val = getattr(item, "value", None)
-    if isinstance(val, dict):
-        return json.dumps(val, ensure_ascii=False, sort_keys=True)
-    return ""
+    store = PageIndexStore(root_dir=pageindex_ltm_dir(_memory_project_root()))
+    val = store.get(ns, k)
+    return json.dumps(val, ensure_ascii=False, sort_keys=True) if isinstance(val, dict) else ""
 
 
 @tool
 def memory_ltm_delete(namespace: str, key: str, runtime: ToolRuntime) -> str:
     """Delete a long-term memory item by (namespace, key)."""
-    store = getattr(runtime, "store", None)
-    if store is None:
+    try:
+        from memory.paths import pageindex_ltm_dir
+        from memory.storage import PageIndexStore
+    except Exception:
         return "OK"
     ns = _parse_namespace(namespace, default=("mem",))
     k = (key or "").strip()
     if not k:
         return "Missing key."
+    store = PageIndexStore(root_dir=pageindex_ltm_dir(_memory_project_root()))
     store.delete(ns, k)
     return "OK"
 
@@ -1627,13 +2093,16 @@ def memory_ltm_search(
     filter_json: str = "",
     limit: int = 12,
 ) -> str:
-    """Search long-term memory within a namespace (vector similarity + optional JSON filter)."""
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return "Store unavailable."
+    """Search long-term memory PageIndex docs within a namespace."""
+    try:
+        from memory.paths import pageindex_ltm_dir
+        from memory.storage import PageIndexStore
+        from memory.query import _tokens as _pi_tokens
+    except Exception as e:
+        return f"Import failed: {e}"
     ns = _parse_namespace(namespace, default=("mem",))
     q = (query or "").strip() or None
-    filt = None
+    filt: dict[str, object] | None = None
     raw_filter = (filter_json or "").strip()
     if raw_filter:
         try:
@@ -1643,40 +2112,262 @@ def memory_ltm_search(
         except Exception:
             filt = None
     n = max(1, min(50, int(limit or 12)))
-    try:
-        items = store.search(ns, query=q, filter=filt, limit=n)
-    except TypeError:
-        items = store.search(ns, query=q, filter=filt)
-        if isinstance(items, list):
-            items = items[:n]
+    store = PageIndexStore(root_dir=pageindex_ltm_dir(_memory_project_root()))
+    start_d, end_d = _infer_date_window(q or "", filt)
+    keywords = _keywords_from_filter_or_query(q or "", filt)
+    toks = _pi_tokens(q or "") if q else []
+
+    def walk_nodes(nodes: object) -> list[dict[str, object]]:
+        out_nodes: list[dict[str, object]] = []
+        if isinstance(nodes, dict):
+            out_nodes.append(nodes)
+            ch = nodes.get("nodes")
+            if isinstance(ch, list):
+                for c in ch:
+                    out_nodes.extend(walk_nodes(c))
+        elif isinstance(nodes, list):
+            for n0 in nodes:
+                out_nodes.extend(walk_nodes(n0))
+        return out_nodes
+
+    candidates: list[tuple[float, str, dict[str, object]]] = []
+    for key0, _ in store.iter_docs(ns):
+        doc = store.get(ns, key0)
+        if not isinstance(doc, dict):
+            continue
+        meta = doc.get("meta")
+        meta_dict = meta if isinstance(meta, dict) else {}
+        d = meta_dict.get("created_date")
+        if isinstance(d, str) and d:
+            try:
+                d_int = int(d.replace("-", ""))
+            except Exception:
+                d_int = None
+        else:
+            d_int = None
+        if start_d is not None or end_d is not None:
+            if d_int is None:
+                continue
+            if start_d is not None and d_int < start_d:
+                continue
+            if end_d is not None and d_int > end_d:
+                continue
+        item_kws = meta_dict.get("keywords") if isinstance(meta_dict.get("keywords"), list) else []
+        item_kws_l = [x for x in item_kws if isinstance(x, str)]
+        item_text = json.dumps(meta_dict, ensure_ascii=False, sort_keys=True)
+        ok, hit_score = _ltm_match_keywords(keywords=keywords, item_keywords=item_kws_l, item_text=item_text)
+        if not ok and keywords:
+            continue
+        score = float(hit_score)
+        if toks:
+            structure = doc.get("structure")
+            for node in walk_nodes(structure):
+                text_parts: list[str] = []
+                for kk in ("title", "summary", "text"):
+                    vv = node.get(kk)
+                    if isinstance(vv, str) and vv:
+                        text_parts.append(vv)
+                blob = " ".join(text_parts).lower()
+                for t in toks:
+                    if t and t in blob:
+                        score += 1.0
+        updated_ts = meta_dict.get("updated_ts")
+        if isinstance(updated_ts, (int, float)):
+            score += float(updated_ts) / 1_000_000_000.0
+        candidates.append((score, key0, doc))
+
+    candidates.sort(key=lambda x: x[0], reverse=True)
     out: list[dict[str, object]] = []
-    if isinstance(items, list):
-        for it in items:
-            out.append(
-                {
-                    "namespace": list(getattr(it, "namespace", ()) or ()),
-                    "key": getattr(it, "key", ""),
-                    "score": getattr(it, "score", None),
-                    "value": getattr(it, "value", None),
-                }
-            )
+    for score, key0, doc in candidates[:n]:
+        out.append({"namespace": list(ns), "key": key0, "score": score, "value": doc})
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def memory_ltm_search_index(
+    namespace: str,
+    runtime: ToolRuntime,
+    query: str = "",
+    filter_json: str = "",
+    limit: int = 12,
+) -> str:
+    """Search long-term memory by time and metadata first; returns metadata without node content."""
+    try:
+        from memory.paths import pageindex_ltm_dir
+        from memory.storage import PageIndexStore
+    except Exception as e:
+        return f"Import failed: {e}"
+    ns = _parse_namespace(namespace, default=("mem",))
+    q = (query or "").strip()
+    filt: dict[str, object] | None = None
+    raw_filter = (filter_json or "").strip()
+    if raw_filter:
+        try:
+            parsed = json.loads(raw_filter)
+            if isinstance(parsed, dict):
+                filt = parsed
+        except Exception:
+            filt = None
+    n = max(1, min(50, int(limit or 12)))
+    start_d, end_d = _infer_date_window(q, filt)
+    keywords = _keywords_from_filter_or_query(q, filt)
+    store = PageIndexStore(root_dir=pageindex_ltm_dir(_memory_project_root()))
+    candidates: list[tuple[float, str, dict[str, object]]] = []
+    for key0, _ in store.iter_docs(ns):
+        doc = store.get(ns, key0)
+        if not isinstance(doc, dict):
+            continue
+        meta = doc.get("meta")
+        meta_dict = meta if isinstance(meta, dict) else {}
+        d = meta_dict.get("created_date")
+        if isinstance(d, str) and d:
+            try:
+                d_int = int(d.replace("-", ""))
+            except Exception:
+                d_int = None
+        else:
+            d_int = None
+        if start_d is not None or end_d is not None:
+            if d_int is None:
+                continue
+            if start_d is not None and d_int < start_d:
+                continue
+            if end_d is not None and d_int > end_d:
+                continue
+        item_kws = meta_dict.get("keywords") if isinstance(meta_dict.get("keywords"), list) else []
+        item_kws_l = [x for x in item_kws if isinstance(x, str)]
+        item_text = json.dumps(meta_dict, ensure_ascii=False, sort_keys=True)
+        ok, hit_score = _ltm_match_keywords(keywords=keywords, item_keywords=item_kws_l, item_text=item_text)
+        if not ok and keywords:
+            continue
+        updated_ts = meta_dict.get("updated_ts")
+        score = float(hit_score)
+        if isinstance(updated_ts, (int, float)):
+            score += float(updated_ts) / 1_000_000_000.0
+        out_meta = dict(meta_dict)
+        out_meta.pop("structure", None)
+        candidates.append((score, key0, out_meta))
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    out: list[dict[str, object]] = []
+    for score, key0, meta_dict in candidates[:n]:
+        out.append({"namespace": list(ns), "key": key0, "score": score, "meta": meta_dict})
     return json.dumps(out, ensure_ascii=False, sort_keys=True)
 
 
 @tool
 def memory_ltm_list_namespaces(runtime: ToolRuntime, prefix: str = "") -> str:
     """List available namespaces in the long-term memory store."""
-    store = getattr(runtime, "store", None)
-    if store is None:
-        return "[]"
-    p = _parse_namespace(prefix, default=())
     try:
-        namespaces = store.list_namespaces(prefix=p if p else None, limit=200)
-    except TypeError:
-        namespaces = store.list_namespaces()
+        from memory.paths import pageindex_ltm_dir
+        from memory.storage import PageIndexStore
+    except Exception:
+        return "[]"
+    store = PageIndexStore(root_dir=pageindex_ltm_dir(_memory_project_root()))
+    p = _parse_namespace(prefix, default=())
+    namespaces = store.list_namespaces(prefix=p if p else None, limit=200)
     out: list[list[str]] = []
     if isinstance(namespaces, list):
         for ns in namespaces:
             if isinstance(ns, tuple):
                 out.append(list(ns))
     return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+def _parse_run_ts(run_at: str) -> float | None:
+    s = (run_at or "").strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        pass
+    s = s.replace(" ", "T")
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except Exception:
+        return None
+    try:
+        return dt.timestamp()
+    except Exception:
+        return None
+
+
+@tool
+def reminder_schedule_at(message: str, run_at: str, reminder_id: str = "") -> str:
+    """Schedule a one-shot reminder at a specific time (ISO string or unix seconds)."""
+    from system.manager import get_global_system_manager
+
+    mgr = get_global_system_manager()
+    if mgr is None:
+        return "SystemManager is not available."
+    ts = _parse_run_ts(run_at)
+    if ts is None:
+        return "Invalid run_at. Use ISO datetime (e.g. 2026-02-10T18:00:00) or unix seconds."
+    try:
+        rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id)
+    except Exception as e:
+        return f"Failed: {type(e).__name__}: {e}"
+    return json.dumps({"ok": True, "id": rid, "run_ts": ts}, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def reminder_schedule_in(message: str, delay_s: int = 60, reminder_id: str = "") -> str:
+    """Schedule a one-shot reminder after delay seconds."""
+    from system.manager import get_global_system_manager
+
+    mgr = get_global_system_manager()
+    if mgr is None:
+        return "SystemManager is not available."
+    try:
+        rid = mgr.reminder_create_in(delay_s=float(delay_s), message=message, reminder_id=reminder_id)
+    except Exception as e:
+        return f"Failed: {type(e).__name__}: {e}"
+    return json.dumps({"ok": True, "id": rid, "delay_s": int(delay_s)}, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def reminder_cancel(reminder_id: str) -> str:
+    """Cancel a scheduled reminder by id."""
+    from system.manager import get_global_system_manager
+
+    mgr = get_global_system_manager()
+    if mgr is None:
+        return "SystemManager is not available."
+    ok = bool(mgr.reminder_cancel(reminder_id))
+    return json.dumps({"ok": ok, "id": (reminder_id or "").strip()}, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def reminder_list(status: str = "") -> str:
+    """List reminders recorded in the system."""
+    from system.manager import get_global_system_manager
+
+    mgr = get_global_system_manager()
+    if mgr is None:
+        return "SystemManager is not available."
+    items = mgr.reminder_list()
+    st = (status or "").strip().lower()
+    if st:
+        items = [it for it in items if str(it.get("status") or "").lower() == st]
+    return json.dumps(items, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def system_time() -> str:
+    """Get current system time with local timezone and UTC."""
+    now_local = datetime.now().astimezone()
+    now_utc = now_local.astimezone(tz=timezone.utc)
+    offset = now_local.utcoffset()
+    offset_s = int(offset.total_seconds()) if offset is not None else 0
+    data = {
+        "unix_ts": time.time(),
+        "local": {
+            "iso": now_local.replace(microsecond=0).isoformat(),
+            "tzname": str(now_local.tzname() or ""),
+            "utc_offset_seconds": offset_s,
+        },
+        "utc": {"iso": now_utc.replace(microsecond=0).isoformat().replace("+00:00", "Z")},
+    }
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)

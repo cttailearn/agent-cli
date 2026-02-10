@@ -111,6 +111,9 @@ def main() -> None:
     os.environ["AGENT_MODEL_NAME"] = str(args.model or "")
     os.environ.setdefault("AGENT_STREAM_DELEGATION", "1")
     os.environ.setdefault("AGENT_STREAM_SUBPROCESS", "1")
+    os.environ.setdefault("AGENT_PAGEINDEX_DAILY_ENABLE", "1")
+    os.environ.setdefault("AGENT_PAGEINDEX_DAILY_AT", "17:00")
+    os.environ.setdefault("AGENT_PAGEINDEX_REALTIME", "0")
     os.chdir(work_dir)
 
     memory_manager = MemoryManager(project_root=project_root, model_name=args.model)

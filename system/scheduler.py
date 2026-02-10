@@ -58,6 +58,42 @@ class SystemScheduler:
             self._wake.set()
         return True
 
+    def register_task(self, task: SystemTask) -> bool:
+        tid = (getattr(task, "id", "") or "").strip()
+        if not tid:
+            return False
+        with self._lock:
+            self._tasks[tid] = task
+        now_ts = time.time()
+        try:
+            run_ts = task.schedule.next_run_ts(now_ts=now_ts)
+        except Exception:
+            run_ts = None
+        if run_ts is not None:
+            with self._lock:
+                heapq.heappush(self._q, _QueueItem(run_ts=float(run_ts), task_id=tid))
+                self._wake.set()
+        else:
+            self._wake.set()
+        return True
+
+    def unregister_task(self, task_id: str) -> bool:
+        tid = (task_id or "").strip()
+        if not tid:
+            return False
+        removed = False
+        with self._lock:
+            removed = self._tasks.pop(tid, None) is not None
+            if removed and self._q:
+                self._q = [it for it in self._q if it.task_id != tid]
+                heapq.heapify(self._q)
+            self._wake.set()
+        return removed
+
+    def list_task_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._tasks.keys())
+
     def _seed(self) -> None:
         now_ts = time.time()
         with self._lock:

@@ -581,7 +581,9 @@ def build_agent(
     from memory.paths import langgraph_store_path
     from memory.storage import PersistentInMemoryStore
 
-    store = PersistentInMemoryStore(path=langgraph_store_path(project_root))
+    langgraph_path = langgraph_store_path(project_root)
+    langgraph_path.parent.mkdir(parents=True, exist_ok=True)
+    store = PersistentInMemoryStore(path=langgraph_path)
     checkpointer = InMemorySaver()
 
     store = _LockedProxy(store)
