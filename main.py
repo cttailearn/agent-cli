@@ -11,7 +11,7 @@ import dotenv
 from agents.runtime import build_agent
 from memory import MemoryManager, ensure_memory_scaffold
 from system import SystemManager
-from terminal_display import CliState, handle_local_command, stream_assistant_reply
+from system.terminal_display import CliState, handle_local_command, stream_assistant_reply
 
 
 dotenv.load_dotenv()
@@ -111,13 +111,9 @@ def main() -> None:
     os.environ["AGENT_MODEL_NAME"] = str(args.model or "")
     os.environ.setdefault("AGENT_STREAM_DELEGATION", "1")
     os.environ.setdefault("AGENT_STREAM_SUBPROCESS", "1")
-    os.environ.setdefault("AGENT_PAGEINDEX_DAILY_ENABLE", "1")
-    os.environ.setdefault("AGENT_PAGEINDEX_DAILY_AT", "17:00")
-    os.environ.setdefault("AGENT_PAGEINDEX_REALTIME", "0")
     os.chdir(work_dir)
 
     memory_manager = MemoryManager(project_root=project_root, model_name=args.model)
-    os.environ["AGENT_THREAD_ID"] = memory_manager.session_id
     memory_manager.start()
 
     def _resolve_dir(base: Path, raw: str) -> Path:
@@ -184,7 +180,7 @@ def main() -> None:
                 print(
                     f"{label}: input={usage.get('input_tokens', 0)} output={usage.get('output_tokens', 0)} total={usage.get('total_tokens', 0)}"
                 )
-            memory_manager.record_turn(user_text=user_text, assistant_text=assistant_text)
+            memory_manager.record_turn(user_text=user_text, assistant_text=assistant_text, token_usage=usage if usage else None)
             return
 
         if state.skill_count:
@@ -218,7 +214,11 @@ def main() -> None:
                     print(
                         f"{label}: input={usage.get('input_tokens', 0)} output={usage.get('output_tokens', 0)} total={usage.get('total_tokens', 0)}"
                     )
-                memory_manager.record_turn(user_text=user_text, assistant_text=assistant_text)
+                memory_manager.record_turn(
+                    user_text=user_text,
+                    assistant_text=assistant_text,
+                    token_usage=usage if usage else None,
+                )
         except KeyboardInterrupt:
             print("\n已退出。")
     finally:

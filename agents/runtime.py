@@ -505,11 +505,19 @@ def _ensure_thread_id() -> str:
     return tid
 
 
+def _ensure_user_id() -> str:
+    uid = (os.environ.get("AGENT_USER_ID") or "").strip()
+    if uid:
+        return uid
+    os.environ["AGENT_USER_ID"] = "default"
+    return "default"
+
+
 def _agent_stream_config(*, checkpoint_ns: str, thread_id: str | None = None) -> dict[str, object]:
     tid = (thread_id or "").strip() or _ensure_thread_id()
     return {
         "recursion_limit": _recursion_limit(),
-        "configurable": {"thread_id": tid, "checkpoint_ns": (checkpoint_ns or "").strip()},
+        "configurable": {"thread_id": tid, "user_id": _ensure_user_id(), "checkpoint_ns": (checkpoint_ns or "").strip()},
     }
 
 

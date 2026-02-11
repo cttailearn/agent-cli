@@ -23,16 +23,8 @@ from agents.tools import (
     memory_core_append,
     memory_core_read,
     memory_core_write,
-    memory_kg_recall,
-    memory_kg_stats,
-    memory_pageindex_ingest,
-    memory_pageindex_search,
-    memory_ltm_delete,
-    memory_ltm_get,
-    memory_ltm_list_namespaces,
-    memory_ltm_put,
-    memory_ltm_search,
-    memory_ltm_search_index,
+    memory_session_query,
+    memory_session_search,
     memory_user_read,
     memory_user_write,
     read_file,
@@ -77,6 +69,16 @@ def build_single_agent(
                 tid = (configurable.get("thread_id") or "").strip()
                 if tid:
                     return tid
+        return "default"
+
+    def _runtime_user_id(runtime: ToolRuntime) -> str:
+        cfg = getattr(runtime, "config", None) or {}
+        if isinstance(cfg, dict):
+            configurable = cfg.get("configurable") or {}
+            if isinstance(configurable, dict):
+                uid = (configurable.get("user_id") or "").strip()
+                if uid:
+                    return uid
         return "default"
 
     @tool
@@ -131,7 +133,7 @@ def build_single_agent(
 
     @tool
     def remember(key: str, value: str, runtime: ToolRuntime) -> str:
-        """Store a memory item for the current session."""
+        """Store a long-term memory item for the current user (shared across threads)."""
         k = (key or "").strip()
         if not k:
             return "Missing key."
@@ -140,19 +142,19 @@ def build_single_agent(
         if store_obj is None:
             memory[k] = v
             return "OK"
-        store_obj.put(("sessions", _runtime_thread_id(runtime)), k, {"value": v})
+        store_obj.put((_runtime_user_id(runtime), "memories"), k, {"value": v})
         return "OK"
 
     @tool
     def recall(key: str, runtime: ToolRuntime) -> str:
-        """Recall a memory item for the current session."""
+        """Recall a long-term memory item for the current user (shared across threads)."""
         k = (key or "").strip()
         if not k:
             return "Missing key."
         store_obj = getattr(runtime, "store", None)
         if store_obj is None:
             return memory.get(k, "")
-        item = store_obj.get(("sessions", _runtime_thread_id(runtime)), k)
+        item = store_obj.get((_runtime_user_id(runtime), "memories"), k)
         if item is None:
             return ""
         val = getattr(item, "value", None)
@@ -163,14 +165,14 @@ def build_single_agent(
 
     @tool
     def forget(key: str, runtime: ToolRuntime) -> str:
-        """Delete a memory item for the current session."""
+        """Delete a long-term memory item for the current user (shared across threads)."""
         k = (key or "").strip()
         if not k:
             return "Missing key."
         store_obj = getattr(runtime, "store", None)
         if store_obj is None:
             return "OK" if memory.pop(k, None) is not None else "Not found."
-        store_obj.delete(("sessions", _runtime_thread_id(runtime)), k)
+        store_obj.delete((_runtime_user_id(runtime), "memories"), k)
         return "OK"
 
     @tool
@@ -243,16 +245,8 @@ def build_single_agent(
             reminder_cancel,
             memory_core_read,
             memory_user_read,
-            memory_kg_recall,
-            memory_kg_stats,
-            memory_pageindex_ingest,
-            memory_pageindex_search,
-            memory_ltm_put,
-            memory_ltm_get,
-            memory_ltm_delete,
-            memory_ltm_search,
-            memory_ltm_search_index,
-            memory_ltm_list_namespaces,
+            memory_session_query,
+            memory_session_search,
             Read,
             Write,
             edit_file,
@@ -285,10 +279,8 @@ def build_single_agent(
             "当命令可能长时间运行或可能卡住时：优先使用 Exec 工具并启用 background/yield_ms，以便随时用 process kill 退出；不要让对话长期阻塞在单次命令上。",
             "当需要长期一致性时：先读取 core 记忆（memory_core_read: identity/traits），再做关键决策。",
             "当用户要求设定/修改你的身份、边界、原则、表达风格时，把稳定信息写入 core 记忆（memory_core_append/memory_core_write）。",
-            "需要回忆长期事实、偏好、人物/项目关系时，优先使用 memory_kg_recall 检索 PageIndex 索引；也可以用 memory_ltm_* 读写结构化长期记忆（同样采用 PageIndex JSON）。",
-            "当用户按具体时间（如“昨天/前天/某日”）要求回忆长期记忆时：先用 memory_ltm_search_index 做时间与关键词定位，再用 memory_ltm_get 加载对应条目内容。",
-            "当用户提供本地 PDF/Markdown 文件希望纳入长期知识时：用 memory_pageindex_ingest 生成 PageIndex，再用 memory_pageindex_search 检索。",
-            "你可以使用 remember/recall/forget 管理会话级记忆；shared_context_put/shared_context_get/shared_context_forget 管理跨回合共享上下文。",
+            "你可以使用 remember/recall/forget 管理长期记忆（按 user_id 跨线程共享）；shared_context_put/shared_context_get/shared_context_forget 管理线程内共享上下文。",
+            "当用户询问你在过去某天/某段时间做了什么、某项目进展、之前的结论/决定时：优先用 memory_session_query（或 memory_session_search）检索会话记忆，再基于检索结果回答。",
             "当收到以 [REMINDER id=...] 或 [SYSTEM_TASK id=...] 开头的消息时：把它当作系统事件处理，直接执行或输出可执行步骤；不要寒暄；不要使用表情符号；不要编造“仍在倒计时/仍在运行”等状态。",
             f"通过 write_file 工具生成的任何文件都必须写入该目录：{output_dir.as_posix()}",
             f"可以通过 read_file/list_dir/write_project_file/delete_path 工具读取与修改项目目录：{project_root.as_posix()}",

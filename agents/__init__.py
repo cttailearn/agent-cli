@@ -66,3 +66,7 @@ def self_test_console_output() -> bool:
         with _CONSOLE_LOCK:
             sys.stdout = prev_stdout
             _CONSOLE_AT_LINE_START = prev_line_start
+
+from .agent import build_single_agent
+
+__all__ = ["build_single_agent"]

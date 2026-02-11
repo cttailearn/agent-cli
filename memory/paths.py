@@ -35,55 +35,6 @@ def core_dir(project_root: Path) -> Path:
     return memory_root(project_root)
 
 
-def chats_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_CHATS_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (pageindex_dir(project_root) / "chats_md").resolve()
-
-
-def kg_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_KG_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (pageindex_dir(project_root) / "kg").resolve()
-
-
-def graph_path(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_GRAPH_PATH") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (kg_dir(project_root) / "graph.json").resolve()
-
-
-def pageindex_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_PAGEINDEX_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (memory_root(project_root) / "pageindex_store").resolve()
-
-
-def pageindex_chats_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_PAGEINDEX_CHATS_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (pageindex_dir(project_root) / "chats").resolve()
-
-
-def pageindex_ltm_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_PAGEINDEX_LTM_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (pageindex_dir(project_root) / "ltm").resolve()
-
-
-def pageindex_docs_dir(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_MEMORY_PAGEINDEX_DOCS_DIR") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (pageindex_dir(project_root) / "docs").resolve()
-
-
 def soul_path(project_root: Path) -> Path:
     raw = (os.environ.get("AGENT_MEMORY_SOUL_PATH") or "").strip()
     if raw:
@@ -129,5 +80,5 @@ def langgraph_store_path(project_root: Path) -> Path:
     raw = (os.environ.get("AGENT_LANGGRAPH_STORE_PATH") or "").strip()
     if raw:
         return _resolve_path(project_root, raw)
-    return (pageindex_dir(project_root) / "episodic" / "langgraph_store.json").resolve()
+    return (memory_root(project_root) / "langgraph_store.json").resolve()
 

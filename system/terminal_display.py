@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -169,6 +170,23 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
     label = "observer"
     stream_delegation = (os.environ.get("AGENT_STREAM_DELEGATION") or "").strip().lower() in {"1", "true", "yes", "on"}
     drain_scope = label if stream_delegation else None
+    carryover_raw = (os.environ.get("AGENT_THREAD_CARRYOVER") or "").strip()
+    if carryover_raw:
+        os.environ["AGENT_THREAD_CARRYOVER"] = ""
+        try:
+            payload = json.loads(carryover_raw)
+        except Exception:
+            payload = None
+        if isinstance(payload, dict):
+            u = payload.get("user")
+            a = payload.get("assistant")
+            if isinstance(u, str) and isinstance(a, str) and (u.strip() or a.strip()):
+                carry_text = (
+                    "上一轮对话（仅用于衔接，非长期记忆）：\n"
+                    f"用户：{u.strip()}\n"
+                    f"助手：{a.strip()}\n"
+                )
+                messages = [{"role": "system", "content": carry_text}, *messages]
     snapshot = action_log_snapshot()
     reset_token_usage()
     reset_estimated_token_usage()

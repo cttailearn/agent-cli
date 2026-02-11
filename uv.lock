@@ -1579,6 +1579,12 @@ wheels = [
 ]
 
 [[package]]
+name = "lunar-python"
+version = "1.4.8"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/59/45/5154c95ae7feaab7ca508e71c3288692c09952dfe33b03b7c2f18a32e2cd/lunar_python-1.4.8.tar.gz", hash = "sha256:3aa11cc73c25e70ddf0ba5bdac7398c03acc9491a3aa512a91c9642973b669d6" }
+
+[[package]]
 name = "lxml"
 version = "6.0.2"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
@@ -5925,6 +5931,7 @@ dependencies = [
     { name = "langchain", extra = ["openai"] },
     { name = "langchain-deepseek" },
     { name = "langchain-mcp-adapters" },
+    { name = "lunar-python" },
     { name = "numpy" },
     { name = "pybel" },
     { name = "rdkit" },
@@ -5940,6 +5947,7 @@ requires-dist = [
     { name = "langchain", extras = ["openai"], specifier = ">=1.2.6" },
     { name = "langchain-deepseek", specifier = ">=1.0.1" },
     { name = "langchain-mcp-adapters", specifier = ">=0.2.1" },
+    { name = "lunar-python", specifier = ">=1.4.8" },
     { name = "numpy", specifier = ">=2.4.1" },
     { name = "pybel", specifier = ">=0.15.5" },
     { name = "rdkit", specifier = ">=2025.9.3" },

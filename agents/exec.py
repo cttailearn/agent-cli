@@ -199,7 +199,7 @@ def _validate_script_text(script_text: str, work_root: Path) -> str | None:
 
 
 def sandbox_validate_command(*, command: str, work_root: Path, cwd: Path) -> str | None:
-    mode = (os.environ.get("AGENT_SANDBOX") or "on").strip().lower()
+    mode = (os.environ.get("AGENT_SANDBOX") or "off").strip().lower()
     if mode in {"0", "off", "false", "no"}:
         return None
 

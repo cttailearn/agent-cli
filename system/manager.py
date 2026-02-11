@@ -13,9 +13,7 @@ from .scheduler import SystemScheduler
 from .schedules import DailyAtSchedule, IntervalSchedule, ManualSchedule, OneShotSchedule, Schedule
 from .tasks import (
     AgentReminderTask,
-    KnowledgeGraphBackfillTask,
     ObserverPromptTask,
-    PageIndexDailyExtractTask,
     SystemContext,
     SystemTask,
 )
@@ -106,10 +104,6 @@ class SystemManager:
         self._scheduler.register_task(task)
         if float(run_ts) <= now_ts:
             self._scheduler.trigger(rid, when_ts=now_ts + 0.1)
-        self._ctx.memory_manager.record_turn(
-            user_text=f"[REMINDER_CREATE id={rid}]",
-            assistant_text=f"run_ts={float(run_ts)} message={msg}",
-        )
         return rid
 
     def reminder_create_in(self, *, delay_s: float, message: str, reminder_id: str = "") -> str:
@@ -138,7 +132,6 @@ class SystemManager:
                 self._reminders_save(state)
         if changed:
             self._scheduler.unregister_task(rid)
-            self._ctx.memory_manager.record_turn(user_text=f"[REMINDER_CANCEL id={rid}]", assistant_text="OK")
         return changed
 
     def reminder_list(self) -> list[dict[str, object]]:
@@ -159,35 +152,7 @@ class SystemManager:
         return out
 
     def _load_tasks(self) -> list[SystemTask]:
-        def _parse_daily_at(raw: str) -> tuple[int, int, int]:
-            s = (raw or "").strip()
-            if not s:
-                return (17, 0, 0)
-            parts = [p.strip() for p in s.split(":") if p.strip()]
-            try:
-                h = int(parts[0]) if len(parts) >= 1 else 17
-                m = int(parts[1]) if len(parts) >= 2 else 0
-                sec = int(parts[2]) if len(parts) >= 3 else 0
-                return (max(0, min(23, h)), max(0, min(59, m)), max(0, min(59, sec)))
-            except Exception:
-                return (17, 0, 0)
-
-        tasks: list[SystemTask] = [
-            KnowledgeGraphBackfillTask(
-                id="kg_daily_backfill",
-                schedule=DailyAtSchedule(hour=0, minute=5, second=0),
-            )
-        ]
-        daily_enable = (os.environ.get("AGENT_PAGEINDEX_DAILY_ENABLE") or "").strip().lower()
-        if daily_enable in {"", "1", "true", "yes", "on"}:
-            h, m, s = _parse_daily_at(os.environ.get("AGENT_PAGEINDEX_DAILY_AT", "17:00"))
-            tasks.insert(
-                0,
-                PageIndexDailyExtractTask(
-                    id="pageindex_daily_extract",
-                    schedule=DailyAtSchedule(hour=h, minute=m, second=s),
-                ),
-            )
+        tasks: list[SystemTask] = []
         tasks.extend(self._load_agent_tasks())
         tasks.extend(self._load_reminder_tasks())
         return tasks

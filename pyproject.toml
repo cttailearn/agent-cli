@@ -16,6 +16,7 @@ dependencies = [
     "pybel>=0.15.5",
     "rdkit>=2025.9.3",
     "setuptools>=80.10.1",
+    "lunar-python>=1.4.8",
 ]
 
 [[tool.uv.index]]
