@@ -82,3 +82,31 @@ def langgraph_store_path(project_root: Path) -> Path:
         return _resolve_path(project_root, raw)
     return (memory_root(project_root) / "langgraph_store.json").resolve()
 
+
+def rollups_root(project_root: Path) -> Path:
+    raw = (os.environ.get("AGENT_MEMORY_ROLLUPS_DIR") or "").strip()
+    if raw:
+        return _resolve_path(project_root, raw)
+    return (memory_root(project_root) / "rollups").resolve()
+
+
+def rollup_dir(project_root: Path, layer: str) -> Path:
+    k = (layer or "").strip().lower()
+    base = rollups_root(project_root)
+    if k in {"day", "daily", "d"}:
+        return (base / "daily").resolve()
+    if k in {"week", "weekly", "w"}:
+        return (base / "weekly").resolve()
+    if k in {"month", "monthly", "m"}:
+        return (base / "monthly").resolve()
+    if k in {"year", "yearly", "y"}:
+        return (base / "yearly").resolve()
+    return base.resolve()
+
+
+def episodic_dir(project_root: Path) -> Path:
+    raw = (os.environ.get("AGENT_MEMORY_EPISODIC_DIR") or "").strip()
+    if raw:
+        return _resolve_path(project_root, raw)
+    return (memory_root(project_root) / "episodic").resolve()
+

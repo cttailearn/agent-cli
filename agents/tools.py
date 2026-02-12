@@ -1528,11 +1528,11 @@ def _session_memory_md_path(project_root: Path, date_str: str) -> tuple[Path | N
     except Exception:
         return None, "Invalid date. Use YYYY-MM-DD."
     try:
-        from memory.paths import memory_root
+        from memory.paths import episodic_dir
     except Exception as e:
         return None, f"Import failed: {e}"
-    root = memory_root(project_root)
-    p = (root / "sessions" / f"{d}.md").resolve()
+    root = episodic_dir(project_root)
+    p = (root / f"{d}.md").resolve()
     return p, None
 
 
@@ -1564,11 +1564,11 @@ def _session_memory_md_paths(project_root: Path, selector: str) -> tuple[list[tu
         return [(d, p)], None
 
     try:
-        from memory.paths import memory_root
+        from memory.paths import episodic_dir
     except Exception as e:
         return [], f"Import failed: {e}"
 
-    sessions_dir = (memory_root(project_root) / "sessions").resolve()
+    sessions_dir = episodic_dir(project_root)
     if raw.lower() in {"all", "*"}:
         if not sessions_dir.exists() or not sessions_dir.is_dir():
             return [], None
@@ -1684,6 +1684,109 @@ def _infer_keyword_from_question(q: str) -> str:
     s2 = re.sub(r"\s+", " ", s2).strip()
     return s2[:80]
 
+def _rollup_md_path(project_root: Path, *, layer: str, key: str) -> tuple[Path | None, str | None]:
+    lay = (layer or "").strip().lower()
+    k = (key or "").strip()
+    try:
+        from memory.paths import rollup_dir
+    except Exception as e:
+        return None, f"Import failed: {e}"
+
+    if lay in {"day", "daily"}:
+        try:
+            date.fromisoformat(k)
+        except Exception:
+            return None, "Invalid daily rollup key. Use YYYY-MM-DD."
+        return (rollup_dir(project_root, "daily") / f"{k}.md").resolve(), None
+    if lay in {"week", "weekly"}:
+        if not re.match(r"^\d{4}-W\d{2}$", k):
+            return None, "Invalid weekly rollup key. Use YYYY-Www (e.g., 2026-W06)."
+        return (rollup_dir(project_root, "weekly") / f"{k}.md").resolve(), None
+    if lay in {"month", "monthly"}:
+        if not re.match(r"^\d{4}-\d{2}$", k):
+            return None, "Invalid monthly rollup key. Use YYYY-MM."
+        return (rollup_dir(project_root, "monthly") / f"{k}.md").resolve(), None
+    if lay in {"year", "yearly"}:
+        if not re.match(r"^\d{4}$", k):
+            return None, "Invalid yearly rollup key. Use YYYY."
+        return (rollup_dir(project_root, "yearly") / f"{k}.md").resolve(), None
+    return None, "Invalid rollup layer."
+
+def _infer_rollup_target_from_question(q: str, date_selector: str) -> tuple[str, str] | None:
+    s = (q or "").strip()
+    ds = (date_selector or "").strip()
+    s2 = s.replace(" ", "")
+    today = date.today()
+
+    if any(x in s2 for x in ["今年", "本年", "这一年"]):
+        return "yearly", f"{today.year:04d}"
+    if any(x in s2 for x in ["去年", "上一年"]):
+        return "yearly", f"{today.year - 1:04d}"
+
+    if any(x in s2 for x in ["本月", "这个月"]):
+        return "monthly", today.strftime("%Y-%m")
+    if "上个月" in s2:
+        first_this_month = today.replace(day=1)
+        last_prev_month = first_this_month - timedelta(days=1)
+        return "monthly", last_prev_month.strftime("%Y-%m")
+
+    if any(x in s2 for x in ["今天", "今日"]):
+        return "daily", today.isoformat()
+    if "昨天" in s2:
+        return "daily", (today - timedelta(days=1)).isoformat()
+    if "前天" in s2:
+        return "daily", (today - timedelta(days=2)).isoformat()
+
+    if any(x in s2 for x in ["本周", "这周", "这一周"]):
+        iso_year, iso_week, _ = today.isocalendar()
+        return "weekly", f"{int(iso_year):04d}-W{int(iso_week):02d}"
+    if any(x in s2 for x in ["上周", "上一周"]):
+        ref = today - timedelta(days=today.weekday() + 1)
+        iso_year, iso_week, _ = ref.isocalendar()
+        return "weekly", f"{int(iso_year):04d}-W{int(iso_week):02d}"
+
+    if re.match(r"^\d{4}-\d{2}$", ds):
+        return "monthly", ds
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", ds):
+        return "daily", ds
+    if ".." in ds:
+        parts = [x.strip() for x in ds.split("..", 1)]
+        if len(parts) == 2:
+            a, b = parts
+            try:
+                da = date.fromisoformat(a)
+                db = date.fromisoformat(b)
+            except Exception:
+                return None
+            if da > db:
+                da, db = db, da
+            if (db.toordinal() - da.toordinal()) <= 6:
+                if da.weekday() == 0 and db.weekday() == 6:
+                    iso_year, iso_week, _ = da.isocalendar()
+                    return "weekly", f"{int(iso_year):04d}-W{int(iso_week):02d}"
+    return None
+
+def _filter_text(text: str, tokens: list[str], *, max_lines: int = 220) -> str:
+    if not tokens:
+        return (text or "").strip()
+    out: list[str] = []
+    for line in (text or "").splitlines():
+        low = line.lower()
+        if line.startswith("#") or line.startswith("## "):
+            if out and out[-1] != "":
+                out.append("")
+            out.append(line)
+            continue
+        if not line.strip():
+            continue
+        if any(t in low for t in tokens):
+            out.append(line)
+        if len(out) >= max_lines:
+            break
+    while out and not out[-1].strip():
+        out.pop()
+    return "\n".join(out).strip()
+
 
 @tool
 def memory_session_query(question: str, date: str = "") -> str:
@@ -1693,12 +1796,30 @@ def memory_session_query(question: str, date: str = "") -> str:
         return ""
     ds = (date or "").strip() or _infer_date_selector_from_question(q)
     kw = _infer_keyword_from_question(q)
+    project_root = _memory_project_root()
+    rollup = _infer_rollup_target_from_question(q, ds)
+    if rollup is not None:
+        layer, key = rollup
+        p, err = _rollup_md_path(project_root, layer=layer, key=key)
+        if err:
+            return err
+        assert p is not None
+        if p.exists() and p.is_file():
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                return f"Read failed: {e}"
+            if not kw:
+                return text.strip()
+            tokens = [t.lower() for t in re.split(r"\s+", kw) if t.strip()]
+            filtered = _filter_text(text, tokens)
+            if filtered:
+                return filtered
     if not kw:
         if ds.lower() in {"all", "*"}:
             today = datetime.now().date()
             start = today - timedelta(days=6)
             ds = f"{start.isoformat()}..{today.isoformat()}"
-        project_root = _memory_project_root()
         paths, err = _session_memory_md_paths(project_root, ds)
         if err:
             return err
@@ -1799,6 +1920,33 @@ def memory_session_search(date: str, keyword: str = "") -> str:
         return ""
 
     tokens = [t.lower() for t in re.split(r"\s+", q) if t.strip()]
+    rollup = _infer_rollup_target_from_question("", date)
+    if rollup is not None:
+        layer, key = rollup
+        p2, err2 = _rollup_md_path(project_root, layer=layer, key=key)
+        if err2:
+            return err2
+        assert p2 is not None
+        if p2.exists() and p2.is_file():
+            try:
+                text2 = p2.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text2 = ""
+            if text2:
+                filtered2 = _filter_text(text2, tokens)
+                if filtered2:
+                    _log_action(
+                        {
+                            "kind": "memory_session_search",
+                            "ok": True,
+                            "path": p2.as_posix(),
+                            "date": date,
+                            "keyword": q,
+                            "hits": -1,
+                            "ts": time.time(),
+                        }
+                    )
+                    return filtered2
     max_hits = 30
     scored: list[tuple[int, str, str, str]] = []
     for ds, p in paths:
