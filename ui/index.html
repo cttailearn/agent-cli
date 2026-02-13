@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agent Chat</title>
+    <script src="./config.js"></script>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0b0f14;
+        --panel: #101826;
+        --text: #e6edf3;
+        --muted: #9aa4b2;
+        --border: #223049;
+        --user: #1f6feb;
+        --assistant: #2ea043;
+        --error: #f85149;
+      }
+      body {
+        margin: 0;
+        font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji",
+          "Segoe UI Emoji";
+        background: var(--bg);
+        color: var(--text);
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 16px;
+        display: grid;
+        grid-template-rows: auto 1fr auto;
+        gap: 12px;
+        height: 100vh;
+        box-sizing: border-box;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      header .title {
+        font-weight: 650;
+        letter-spacing: 0.2px;
+      }
+      header .status {
+        font-size: 12px;
+        color: var(--muted);
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        overflow: hidden;
+        display: grid;
+        grid-template-rows: 1fr;
+      }
+      #log {
+        padding: 12px;
+        overflow: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .msg {
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 10px 12px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        line-height: 1.45;
+      }
+      .msg .meta {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+        display: flex;
+        gap: 10px;
+        align-items: baseline;
+      }
+      .msg.user .meta .role {
+        color: var(--user);
+      }
+      .msg.assistant .meta .role {
+        color: var(--assistant);
+      }
+      .msg.error {
+        border-color: color-mix(in oklab, var(--error) 60%, var(--border));
+      }
+      .msg.error .meta .role {
+        color: var(--error);
+      }
+      .composer {
+        display: grid;
+        grid-template-columns: 1fr auto auto;
+        gap: 10px;
+        align-items: end;
+      }
+      textarea {
+        resize: none;
+        min-height: 54px;
+        max-height: 200px;
+        padding: 10px 12px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: color-mix(in oklab, var(--panel) 75%, black);
+        color: var(--text);
+        outline: none;
+        line-height: 1.45;
+      }
+      button {
+        height: 54px;
+        padding: 0 14px;
+        border-radius: 12px;
+        border: 1px solid var(--border);
+        background: transparent;
+        color: var(--text);
+        cursor: pointer;
+      }
+      button.primary {
+        border-color: color-mix(in oklab, var(--user) 70%, var(--border));
+        background: color-mix(in oklab, var(--user) 26%, transparent);
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
+      .hint {
+        font-size: 12px;
+        color: var(--muted);
+        margin-top: 6px;
+      }
+      a {
+        color: var(--muted);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <header>
+        <div class="title">Agent WebSocket Chat</div>
+        <div class="status" id="status">未连接</div>
+      </header>
+      <div class="panel">
+        <div id="log"></div>
+      </div>
+      <div>
+        <div class="composer">
+          <textarea id="input" placeholder="输入消息，回车发送；Shift+Enter 换行"></textarea>
+          <button id="reset">重置</button>
+          <button class="primary" id="send">发送</button>
+        </div>
+        <div class="hint">后端：<a id="apiBase" href="#" target="_blank"></a>；健康检查：<a id="healthLink" href="#" target="_blank"></a></div>
+      </div>
+    </div>
+
+    <script>
+      const statusEl = document.getElementById("status");
+      const logEl = document.getElementById("log");
+      const inputEl = document.getElementById("input");
+      const sendBtn = document.getElementById("send");
+      const resetBtn = document.getElementById("reset");
+
+      let ws = null;
+      let busy = false;
+      let currentAssistantEl = null;
+      const apiBase = String(window.AGENT_API_BASE || "").trim() || `${location.origin}`;
+      const apiBaseEl = document.getElementById("apiBase");
+      const healthEl = document.getElementById("healthLink");
+      apiBaseEl.textContent = apiBase;
+      apiBaseEl.href = apiBase;
+      healthEl.textContent = `${apiBase}/health`;
+      healthEl.href = `${apiBase}/health`;
+      apiBaseEl.addEventListener("click", (e) => {
+        e.preventDefault();
+        const v = prompt("设置后端地址（例如 http://192.168.1.10:58452）", apiBase);
+        if (!v) return;
+        try {
+          localStorage.setItem("AGENT_API_BASE", String(v).trim());
+        } catch {}
+        location.reload();
+      });
+
+      function setStatus(s) {
+        statusEl.textContent = s;
+      }
+
+      function formatUsage(usage) {
+        if (!usage) return "";
+        const input = Number(usage.input_tokens || 0);
+        const output = Number(usage.output_tokens || 0);
+        const total = Number(usage.total_tokens || 0);
+        return `tokens: in=${input} out=${output} total=${total}`;
+      }
+
+      function appendMessage(role, text, extraMeta) {
+        const el = document.createElement("div");
+        el.className = "msg " + role;
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        const roleEl = document.createElement("div");
+        roleEl.className = "role";
+        roleEl.textContent = role;
+        meta.appendChild(roleEl);
+        if (extraMeta) {
+          const extra = document.createElement("div");
+          extra.textContent = extraMeta;
+          meta.appendChild(extra);
+        }
+        const body = document.createElement("div");
+        body.className = "body";
+        body.textContent = text || "";
+        el.appendChild(meta);
+        el.appendChild(body);
+        logEl.appendChild(el);
+        logEl.scrollTop = logEl.scrollHeight;
+        return el;
+      }
+
+      function ensureSocket() {
+        if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+        const wsBase = apiBase.startsWith("https:") ? apiBase.replace(/^https:/, "wss:") : apiBase.replace(/^http:/, "ws:");
+        const url = `${wsBase.replace(/\/+$/, "")}/ws`;
+        ws = new WebSocket(url);
+        setStatus("连接中…");
+        ws.onopen = () => setStatus("已连接");
+        ws.onclose = () => {
+          setStatus("已断开");
+          ws = null;
+          busy = false;
+          sendBtn.disabled = false;
+        };
+        ws.onerror = () => setStatus("连接错误");
+        ws.onmessage = (ev) => {
+          let msg = null;
+          try {
+            msg = JSON.parse(ev.data);
+          } catch {
+            msg = { type: "assistant_delta", delta: String(ev.data || "") };
+          }
+
+          if (msg.type === "assistant_delta") {
+            if (!currentAssistantEl) {
+              currentAssistantEl = appendMessage("assistant", "");
+            }
+            const body = currentAssistantEl.querySelector(".body");
+            body.textContent += msg.delta || "";
+            logEl.scrollTop = logEl.scrollHeight;
+            return;
+          }
+
+          if (msg.type === "done") {
+            busy = false;
+            sendBtn.disabled = false;
+            const usage = formatUsage(msg.usage);
+            if (!currentAssistantEl) {
+              currentAssistantEl = appendMessage("assistant", msg.assistant || "", usage);
+            } else {
+              const meta = currentAssistantEl.querySelector(".meta");
+              if (usage) {
+                const extra = document.createElement("div");
+                extra.textContent = usage;
+                meta.appendChild(extra);
+              }
+            }
+            currentAssistantEl = null;
+            return;
+          }
+
+          if (msg.type === "error") {
+            busy = false;
+            sendBtn.disabled = false;
+            appendMessage("error", msg.message || "unknown error");
+            currentAssistantEl = null;
+            return;
+          }
+
+          if (msg.type === "reset") {
+            appendMessage("assistant", "已重置会话");
+            currentAssistantEl = null;
+            return;
+          }
+        };
+      }
+
+      function sendText(text) {
+        ensureSocket();
+        if (!ws || ws.readyState !== WebSocket.OPEN) {
+          appendMessage("error", "WebSocket 未连接");
+          return;
+        }
+        if (busy) return;
+        busy = true;
+        sendBtn.disabled = true;
+        currentAssistantEl = null;
+        appendMessage("user", text);
+        ws.send(JSON.stringify({ text }));
+      }
+
+      sendBtn.addEventListener("click", () => {
+        const text = (inputEl.value || "").trim();
+        if (!text) return;
+        inputEl.value = "";
+        sendText(text);
+      });
+
+      resetBtn.addEventListener("click", () => {
+        ensureSocket();
+        if (!ws || ws.readyState !== WebSocket.OPEN) return;
+        ws.send("/reset");
+      });
+
+      inputEl.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendBtn.click();
+        }
+      });
+
+      ensureSocket();
+    </script>
+  </body>
+</html>

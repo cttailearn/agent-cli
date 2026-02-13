@@ -9,6 +9,7 @@ dependencies = [
     "deepagents>=0.3.6",
     "deepagents-cli>=0.0.3",
     "dotenv>=0.9.9",
+    "fastapi>=0.115.0",
     "langchain-deepseek>=1.0.1",
     "langchain[openai]>=1.2.6",
     "langchain-mcp-adapters>=0.2.1",
@@ -16,6 +17,7 @@ dependencies = [
     "pybel>=0.15.5",
     "rdkit>=2025.9.3",
     "setuptools>=80.10.1",
+    "uvicorn[standard]>=0.34.0",
     "lunar-python>=1.4.8",
 ]
 

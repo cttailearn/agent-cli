@@ -9,6 +9,7 @@ from pathlib import Path
 
 from langchain.agents.middleware.types import AgentState
 from langchain.chat_models import init_chat_model
+from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.messages import AIMessageChunk, BaseMessage, BaseMessageChunk, ToolMessage, ToolMessageChunk
 from langchain_deepseek import ChatDeepSeek
 from typing_extensions import TypedDict
@@ -19,14 +20,18 @@ from agents.tools import action_log_snapshot, actions_since, action_scope, load_
 from memory import create_memory_middleware
 
 
-_TOKEN_USAGE: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+_TOKEN_USAGE_MSG: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+_TOKEN_USAGE_CB: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 _ESTIMATED_TOKEN_USAGE: dict[str, int] = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
 
 
 def reset_token_usage() -> None:
-    _TOKEN_USAGE["input_tokens"] = 0
-    _TOKEN_USAGE["output_tokens"] = 0
-    _TOKEN_USAGE["total_tokens"] = 0
+    _TOKEN_USAGE_MSG["input_tokens"] = 0
+    _TOKEN_USAGE_MSG["output_tokens"] = 0
+    _TOKEN_USAGE_MSG["total_tokens"] = 0
+    _TOKEN_USAGE_CB["input_tokens"] = 0
+    _TOKEN_USAGE_CB["output_tokens"] = 0
+    _TOKEN_USAGE_CB["total_tokens"] = 0
 
 
 def reset_estimated_token_usage() -> None:
@@ -36,7 +41,11 @@ def reset_estimated_token_usage() -> None:
 
 
 def get_token_usage() -> dict[str, int]:
-    return dict(_TOKEN_USAGE)
+    msg = dict(_TOKEN_USAGE_MSG)
+    cb = dict(_TOKEN_USAGE_CB)
+    msg_total = int(msg.get("total_tokens") or 0)
+    cb_total = int(cb.get("total_tokens") or 0)
+    return cb if cb_total >= msg_total else msg
 
 
 def get_estimated_token_usage() -> dict[str, int]:
@@ -108,9 +117,38 @@ def capture_token_usage_from_message(msg: object) -> None:
     usage = _extract_token_usage_from_message(msg)
     if usage is None:
         return
-    _TOKEN_USAGE["input_tokens"] += usage["input_tokens"]
-    _TOKEN_USAGE["output_tokens"] += usage["output_tokens"]
-    _TOKEN_USAGE["total_tokens"] += usage["total_tokens"]
+    _TOKEN_USAGE_MSG["input_tokens"] += usage["input_tokens"]
+    _TOKEN_USAGE_MSG["output_tokens"] += usage["output_tokens"]
+    _TOKEN_USAGE_MSG["total_tokens"] += usage["total_tokens"]
+
+
+class _TokenUsageCallback(BaseCallbackHandler):
+    def on_llm_end(self, response, **kwargs):
+        llm_output = getattr(response, "llm_output", None)
+        if isinstance(llm_output, dict):
+            usage = _normalize_token_usage(llm_output.get("token_usage"))
+            if usage is None:
+                usage = _normalize_token_usage(llm_output.get("usage"))
+            if usage is not None:
+                _TOKEN_USAGE_CB["input_tokens"] += usage["input_tokens"]
+                _TOKEN_USAGE_CB["output_tokens"] += usage["output_tokens"]
+                _TOKEN_USAGE_CB["total_tokens"] += usage["total_tokens"]
+                return
+
+        generations = getattr(response, "generations", None)
+        if not isinstance(generations, list):
+            return
+        for group in generations:
+            if not isinstance(group, list):
+                continue
+            for gen in group:
+                msg = getattr(gen, "message", None)
+                usage2 = _extract_token_usage_from_message(msg) if msg is not None else None
+                if usage2 is None:
+                    continue
+                _TOKEN_USAGE_CB["input_tokens"] += usage2["input_tokens"]
+                _TOKEN_USAGE_CB["output_tokens"] += usage2["output_tokens"]
+                _TOKEN_USAGE_CB["total_tokens"] += usage2["total_tokens"]
 
 
 def _estimate_tokens(text: str) -> int:
@@ -559,20 +597,28 @@ def _format_tools(tools: Iterable[object]) -> str:
 
 def _init_model(model_name: str):
     normalized_model = normalize_model_name(model_name)
+    cb = _TokenUsageCallback()
     if normalized_model.startswith("deepseek:"):
         deepseek_model_name = normalized_model.split(":", 1)[1]
-        return ChatDeepSeekThinkingTools(model=deepseek_model_name, streaming=True)
+        try:
+            return ChatDeepSeekThinkingTools(model=deepseek_model_name, streaming=True, callbacks=[cb])
+        except TypeError:
+            return ChatDeepSeekThinkingTools(model=deepseek_model_name, streaming=True)
     try:
         if normalized_model.startswith("openai:"):
             try:
                 return init_chat_model(
                     model=normalized_model,
                     streaming=True,
+                    callbacks=[cb],
                     model_kwargs={"stream_options": {"include_usage": True}},
                 )
             except TypeError:
-                return init_chat_model(model=normalized_model, streaming=True)
-        return init_chat_model(model=normalized_model, streaming=True)
+                return init_chat_model(model=normalized_model, streaming=True, callbacks=[cb])
+        try:
+            return init_chat_model(model=normalized_model, streaming=True, callbacks=[cb])
+        except TypeError:
+            return init_chat_model(model=normalized_model, streaming=True)
     except ValueError as e:
         if "Unable to infer model provider" not in str(e):
             raise
@@ -581,10 +627,11 @@ def _init_model(model_name: str):
                 model=normalized_model,
                 model_provider="openai",
                 streaming=True,
+                callbacks=[cb],
                 model_kwargs={"stream_options": {"include_usage": True}},
             )
         except TypeError:
-            return init_chat_model(model=normalized_model, model_provider="openai", streaming=True)
+            return init_chat_model(model=normalized_model, model_provider="openai", streaming=True, callbacks=[cb])
 
 
 def build_agent(

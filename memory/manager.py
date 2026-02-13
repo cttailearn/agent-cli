@@ -37,77 +37,10 @@ def ensure_memory_scaffold(project_root: Path) -> dict[str, str]:
 
     created: dict[str, str] = {}
     defaults: dict[str, str] = {
-        "soul.md": "\n".join(
-            [
-                "# 灵魂（Soul）",
-                "",
-                "这里记录不可妥协的核心价值、长期目标、底线与原则。",
-                "这些内容应当在长期对话中逐步沉淀，并保持稳定性。",
-                "",
-            ]
-        ),
-        "traits.md": "\n".join(
-            [
-                "# 特性（Traits）",
-                "",
-                "这里记录稳定的行为风格、偏好、表达习惯与工作方式。",
-                "这些内容应当在长期对话中逐步沉淀，并可缓慢演化。",
-                "",
-            ]
-        ),
-        "identity.md": "\n".join(
-            [
-                "# 身份（Identity）",
-                "",
-                "这里记录身份设定、职责边界、对外承诺与不做的事情。",
-                "这些内容应当在长期对话中逐步沉淀，并保持一致性。",
-                "",
-            ]
-        ),
-        "user.md": "\n".join(
-            [
-                "# 用户记忆（User）",
-                "",
-                "这里记录与你对应“用户”的稳定信息，用于长期协作与决策一致性。内容允许更新与修订。",
-                "",
-                "## 超级管理员（主用户）",
-                "",
-                "- 姓名：<未设置>",
-                "- 称呼：<未设置>",
-                "- 识别依据：<未设置>",
-                "",
-                "### 稳定信息",
-                "",
-                "#### 偏好（Preferences）",
-                "",
-                "- ",
-                "",
-                "#### 重要目标（Goals）",
-                "",
-                "- ",
-                "",
-                "#### 关键决策（Decisions）",
-                "",
-                "- ",
-                "",
-                "#### 关键数据（Data）",
-                "",
-                "- ",
-                "",
-                "## 普通用户（非超级管理员）",
-                "",
-                "- （格式）姓名：<未设置>；关系：<未设置>；称呼：<未设置>；备注：",
-                "",
-                "## 识别与权限策略",
-                "",
-                "- 权限模型：超级管理员（主用户）> 普通用户（其余所有用户）。",
-                "- 身份确认门禁：未完成身份确认前，只能使用中性称呼（你/您好），不得直接使用本文件内的个性化称呼。",
-                "- 首次启动或超级管理员未设置时：先识别当前交流对象为超级管理员，询问其姓名/称呼并更新本文件。",
-                "- 其他用户：询问姓名与其和超级管理员的关系，并将关系记录在“普通用户”小节。",
-                "- 不要在此文件记录口令、密钥、一次性验证码等敏感信息。",
-                "",
-            ]
-        ),
+        "soul.md": "",
+        "traits.md": "",
+        "identity.md": "",
+        "user.md": "",
     }
     for name, text in defaults.items():
         if name == "soul.md":
@@ -167,6 +100,28 @@ def _extract_system_text(msg) -> str:
     return str(content)
 
 
+def _extract_text(msg) -> str:
+    if msg is None:
+        return ""
+    text_attr = getattr(msg, "text", None)
+    if isinstance(text_attr, str):
+        return text_attr
+    content = getattr(msg, "content", "") or ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                t = item.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
+        return "".join(parts)
+    return str(content)
+
+
 def _strip_block(text: str, *, start: str, end: str) -> str:
     t = text or ""
     if not t.strip():
@@ -197,11 +152,99 @@ def _core_files_signature(project_root: Path) -> tuple[tuple[str, int, int], ...
     return tuple(sig)
 
 
+_AUTH_KV_RX = re.compile(r"(?i)(?:^|[\s\-*])(?:专属口令|口令|passphrase|auth_pass|auth_token)\s*(?:[:：=])\s*(\S+)")
+_AUTH_INLINE_RX = re.compile(
+    r"(?i)(?:专属口令|口令|passphrase|auth_pass|auth_token)\s*(?:[:：=])\s*(\S+)(?:\s*(?:=>|->|→)\s*(.+))?$"
+)
+
+
+def _extract_last_user_text(request: ModelRequest) -> str:
+    msgs = getattr(request, "messages", None)
+    if isinstance(msgs, list) and msgs:
+        for m in reversed(msgs):
+            t = getattr(m, "type", None)
+            if isinstance(t, str) and t.strip().lower() in {"human", "user"}:
+                return (_extract_text(m) or "").strip()
+            role = getattr(m, "role", None)
+            if isinstance(role, str) and role.strip().lower() == "user":
+                return (_extract_text(m) or "").strip()
+    return ""
+
+
+def _extract_auth_snippets(core_text: str) -> str:
+    text = (core_text or "").strip("\n")
+    if not text:
+        return ""
+    lines = text.splitlines()
+    hit: set[int] = set()
+    for i, line in enumerate(lines):
+        if _AUTH_KV_RX.search(line or ""):
+            hit.add(i)
+            for j in range(i - 1, -1, -1):
+                s = (lines[j] or "").strip()
+                if not s:
+                    break
+                if s.startswith("#"):
+                    hit.add(j)
+                if j <= i - 6:
+                    break
+    if not hit:
+        return ""
+    out: list[str] = []
+    for i in sorted(hit):
+        out.append(lines[i])
+    return "\n".join(out).strip()
+
+
+def _attempt_passphrase_auth(*, core_text: str, user_text: str, runtime, tid: str) -> bool:
+    if not core_text or not user_text:
+        return False
+    store_obj = getattr(runtime, "store", None)
+    if store_obj is None:
+        return False
+    for raw_line in (core_text or "").splitlines():
+        s = (raw_line or "").strip()
+        if not s:
+            continue
+        m = _AUTH_INLINE_RX.search(s)
+        if not m:
+            continue
+        code = (m.group(1) or "").strip()
+        if not code:
+            continue
+        if code not in user_text:
+            continue
+        meta = (m.group(2) or "").strip() if m.lastindex and m.lastindex >= 2 else ""
+        role = "超级管理员" if ("主用户" in meta or "超级管理员" in meta) else ("普通用户" if "普通用户" in meta else "超级管理员")
+        name = ""
+        relation = ""
+        if meta:
+            m2 = re.search(r"(?:name|姓名)\s*(?:[:：=])\s*([^；;，,]+)", meta, flags=re.I)
+            if m2:
+                name = (m2.group(1) or "").strip()
+            m3 = re.search(r"(?:relation|关系)\s*(?:[:：=])\s*([^；;，,]+)", meta, flags=re.I)
+            if m3:
+                relation = (m3.group(1) or "").strip()
+        try:
+            store_obj.put(("shared", tid), "identity_confirmed", {"value": "true"})
+            if role:
+                store_obj.put(("shared", tid), "identity_role", {"value": role})
+            if name:
+                store_obj.put(("shared", tid), "identity_name", {"value": name})
+            if relation:
+                store_obj.put(("shared", tid), "identity_relation", {"value": relation})
+        except Exception:
+            return False
+        return True
+    return False
+
+
 class CoreMemoryMiddleware(AgentMiddleware):
+
+
     def __init__(self, *, project_root: Path) -> None:
         self.project_root = project_root.resolve()
         self._core_sig: tuple[tuple[str, int, int], ...] | None = None
-        self._core_text: str = ""
 
     def _load_core_prompt_cached(self) -> str:
         sig = _core_files_signature(self.project_root)
@@ -216,6 +259,33 @@ class CoreMemoryMiddleware(AgentMiddleware):
         base_text = _extract_system_text(request.system_message)
         core_text = self._load_core_prompt_cached()
         bootstrap = (os.environ.get("AGENT_USER_BOOTSTRAP") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+        identity_confirmed = False
+        runtime = getattr(request, "runtime", None)
+        if runtime is not None:
+            cfg = getattr(runtime, "config", None) or {}
+            tid = ""
+            if isinstance(cfg, dict):
+                configurable = cfg.get("configurable") or {}
+                if isinstance(configurable, dict):
+                    tid = (configurable.get("thread_id") or "").strip()
+            tid = tid or "default"
+
+            store_obj = getattr(runtime, "store", None)
+            if store_obj is not None:
+                try:
+                    item = store_obj.get(("shared", tid), "identity_confirmed")
+                except Exception:
+                    item = None
+                if item is not None:
+                    val = getattr(item, "value", None)
+                    if isinstance(val, dict):
+                        v = val.get("value")
+                        if isinstance(v, str) and v.strip().lower() in {"1", "true", "yes", "y", "on"}:
+                            identity_confirmed = True
+                if not identity_confirmed:
+                    user_text = _extract_last_user_text(request)
+                    if _attempt_passphrase_auth(core_text=core_text, user_text=user_text, runtime=runtime, tid=tid):
+                        identity_confirmed = True
 
         now_dt = datetime.now().astimezone()
         weekday = "一二三四五六日"[now_dt.isoweekday() - 1]
@@ -231,8 +301,13 @@ class CoreMemoryMiddleware(AgentMiddleware):
 
         core_start = "<CORE_MEMORIES priority=highest>"
         core_end = "</CORE_MEMORIES>"
-        core_block = (
-            "\n".join([core_start, "# Core Memories（最高优先级）", "", core_text, core_end]).strip() if core_text else ""
+        core_block = "\n".join([core_start, "# Core Memories（最高优先级）", "", core_text, core_end]).strip() if (identity_confirmed and core_text) else ""
+
+        auth_text = _extract_auth_snippets(core_text)
+        auth_start = "<CORE_AUTH priority=highest>"
+        auth_end = "</CORE_AUTH>"
+        auth_block = (
+            "\n".join([auth_start, "# Core Auth（身份识别用）", "", auth_text, auth_end]).strip() if auth_text else ""
         )
 
         user_start = "<USER_IDENTITY_POLICY priority=highest>"
@@ -241,14 +316,16 @@ class CoreMemoryMiddleware(AgentMiddleware):
             "你需要在对话中识别当前正在与你交流的“用户”，并把稳定信息写入 core/user.md。",
             "识别方式仅使用对方在本次对话中自报的姓名/称呼与其与主用户的关系描述（不要做代码级硬识别）。",
             "不要基于 core/user.md 已存在的记录，直接推断“当前对话对象”就是其中的某个人；core/user.md 只能作为核对与长期记录的载体，不是本轮身份确认的证据。",
+            "若用户在本次对话中提供“专属口令/口令”，且与 core 记忆中的某条口令配置匹配：你可以直接确认身份（不要复述口令），并写入 identity_confirmed=true 以及 identity_name/identity_role/identity_relation（如可得）。",
             "当用户输入不足以确认身份（例如：在吗/你好/帮我一下/继续）时：默认使用中性称呼（你/您好），并先询问“你希望我怎么称呼你？”以及“你与主用户是什么关系？”。",
+            "当身份确认完成时：调用 shared_context_put 写入 identity_confirmed=true，并写入 identity_name/identity_role/identity_relation 以便后续回合稳定执行权限策略与表达风格。",
             "更新 user.md 时：保持 Markdown 结构，小改动写入；重复的合并；不要覆盖主用户已确认的信息。",
             "不要把口令、密钥、一次性验证码等敏感信息写入 user.md。",
         ]
         if bootstrap:
             policy_lines = [
                 "当前为首次启动/主用户未建立：将当前交流对象视为主用户（最高权限）。",
-                "你必须在继续讨论任务前，先询问主用户的姓名与称呼，并将其写入 core/user.md 的“主用户（最高权限）”小节（替换 <未设置>）。",
+                "你必须在继续讨论任务前，先询问主用户的姓名与称呼，并将其写入 core/user.md（如为空或缺少结构则先创建，再写入）。",
                 *policy_lines,
                 "在主用户信息建立后，再继续正常任务对话。",
             ]
@@ -257,8 +334,9 @@ class CoreMemoryMiddleware(AgentMiddleware):
 
         rest = _strip_block(base_text, start=time_start, end=time_end)
         rest = _strip_block(rest, start=core_start, end=core_end)
+        rest = _strip_block(rest, start=auth_start, end=auth_end)
         rest = _strip_block(rest, start=user_start, end=user_end)
-        blocks = [b for b in [time_block, core_block, policy_block, rest.strip()] if b and b.strip()]
+        blocks = [b for b in [time_block, auth_block, core_block, policy_block, rest.strip()] if b and b.strip()]
         new_text = "\n\n".join(blocks).strip()
         if new_text == base_text:
             return handler(request)
