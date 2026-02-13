@@ -26,13 +26,13 @@
     ],
     "deepseek-chat": {
       "env": {
-        "DEEPSEEK_API_KEY": "sk-1e279a890f9b41d0983fdf4200b99da2"
+        "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}"
       },
       "model": "deepseek:deepseek-chat"
     },
     "deepseek-reasoner": {
       "env": {
-        "DEEPSEEK_API_KEY": "sk-1e279a890f9b41d0983fdf4200b99da2"
+        "DEEPSEEK_API_KEY": "${DEEPSEEK_API_KEY}"
       },
       "model": "deepseek:deepseek-reasoner"
     },
@@ -42,7 +42,7 @@
         "兼容 OpenAI 的第三方：请同时配置 OPENAI_BASE_URL（例如 https://xxx/v1）"
       ],
       "env": {
-        "OPENAI_API_KEY": "ms-952c19d5-dbd6-4c9f-b787-8b479735d6c1",
+        "OPENAI_API_KEY": "${OPENAI_API_KEY}",
         "OPENAI_BASE_URL": "https://api-inference.modelscope.cn/v1"
       },
       "model": "moonshotai/Kimi-K2.5"
