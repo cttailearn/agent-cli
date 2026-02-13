@@ -20,14 +20,12 @@ def ensure_memory_scaffold(project_root: Path) -> dict[str, str]:
     root = paths.memory_root(project_root)
     core = paths.core_dir(project_root)
     kg_dir = paths.langgraph_store_path(project_root).parent
-    sessions_dir = (root / "sessions").resolve()
     extracted_dir = paths.episodic_dir(project_root)
     rollups_dir = paths.rollups_root(project_root)
 
     root.mkdir(parents=True, exist_ok=True)
     core.mkdir(parents=True, exist_ok=True)
     kg_dir.mkdir(parents=True, exist_ok=True)
-    sessions_dir.mkdir(parents=True, exist_ok=True)
     extracted_dir.mkdir(parents=True, exist_ok=True)
     try:
         paths.rollup_dir(project_root, "daily").mkdir(parents=True, exist_ok=True)
@@ -72,21 +70,41 @@ def ensure_memory_scaffold(project_root: Path) -> dict[str, str]:
                 "",
                 "这里记录与你对应“用户”的稳定信息，用于长期协作与决策一致性。内容允许更新与修订。",
                 "",
-                "## 偏好（Preferences）",
+                "## 超级管理员（主用户）",
+                "",
+                "- 姓名：<未设置>",
+                "- 称呼：<未设置>",
+                "- 识别依据：<未设置>",
+                "",
+                "### 稳定信息",
+                "",
+                "#### 偏好（Preferences）",
                 "",
                 "- ",
                 "",
-                "## 重要目标（Goals）",
+                "#### 重要目标（Goals）",
                 "",
                 "- ",
                 "",
-                "## 关键决策（Decisions）",
+                "#### 关键决策（Decisions）",
                 "",
                 "- ",
                 "",
-                "## 关键数据（Data）",
+                "#### 关键数据（Data）",
                 "",
                 "- ",
+                "",
+                "## 普通用户（非超级管理员）",
+                "",
+                "- （格式）姓名：<未设置>；关系：<未设置>；称呼：<未设置>；备注：",
+                "",
+                "## 识别与权限策略",
+                "",
+                "- 权限模型：超级管理员（主用户）> 普通用户（其余所有用户）。",
+                "- 身份确认门禁：未完成身份确认前，只能使用中性称呼（你/您好），不得直接使用本文件内的个性化称呼。",
+                "- 首次启动或超级管理员未设置时：先识别当前交流对象为超级管理员，询问其姓名/称呼并更新本文件。",
+                "- 其他用户：询问姓名与其和超级管理员的关系，并将关系记录在“普通用户”小节。",
+                "- 不要在此文件记录口令、密钥、一次性验证码等敏感信息。",
                 "",
             ]
         ),
@@ -197,14 +215,51 @@ class CoreMemoryMiddleware(AgentMiddleware):
     def wrap_model_call(self, request: ModelRequest, handler):
         base_text = _extract_system_text(request.system_message)
         core_text = self._load_core_prompt_cached()
-        if not core_text:
-            return handler(request)
+        bootstrap = (os.environ.get("AGENT_USER_BOOTSTRAP") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-        start = "<CORE_MEMORIES priority=highest>"
-        end = "</CORE_MEMORIES>"
-        core_block = "\n".join([start, "# Core Memories（最高优先级）", "", core_text, end]).strip()
-        rest = _strip_block(base_text, start=start, end=end)
-        new_text = f"{core_block}\n\n{rest}".strip() if rest else core_block
+        now_dt = datetime.now().astimezone()
+        weekday = "一二三四五六日"[now_dt.isoweekday() - 1]
+        now_text = "\n".join(
+            [
+                f"当前时间：{now_dt.isoformat(sep=' ', timespec='seconds')}",
+                f"当前日期：{now_dt.date().isoformat()}（星期{weekday}）",
+            ]
+        ).strip()
+        time_start = "<CURRENT_TIME priority=highest>"
+        time_end = "</CURRENT_TIME>"
+        time_block = "\n".join([time_start, "# 当前时间（最高优先级）", "", now_text, time_end]).strip()
+
+        core_start = "<CORE_MEMORIES priority=highest>"
+        core_end = "</CORE_MEMORIES>"
+        core_block = (
+            "\n".join([core_start, "# Core Memories（最高优先级）", "", core_text, core_end]).strip() if core_text else ""
+        )
+
+        user_start = "<USER_IDENTITY_POLICY priority=highest>"
+        user_end = "</USER_IDENTITY_POLICY>"
+        policy_lines = [
+            "你需要在对话中识别当前正在与你交流的“用户”，并把稳定信息写入 core/user.md。",
+            "识别方式仅使用对方在本次对话中自报的姓名/称呼与其与主用户的关系描述（不要做代码级硬识别）。",
+            "不要基于 core/user.md 已存在的记录，直接推断“当前对话对象”就是其中的某个人；core/user.md 只能作为核对与长期记录的载体，不是本轮身份确认的证据。",
+            "当用户输入不足以确认身份（例如：在吗/你好/帮我一下/继续）时：默认使用中性称呼（你/您好），并先询问“你希望我怎么称呼你？”以及“你与主用户是什么关系？”。",
+            "更新 user.md 时：保持 Markdown 结构，小改动写入；重复的合并；不要覆盖主用户已确认的信息。",
+            "不要把口令、密钥、一次性验证码等敏感信息写入 user.md。",
+        ]
+        if bootstrap:
+            policy_lines = [
+                "当前为首次启动/主用户未建立：将当前交流对象视为主用户（最高权限）。",
+                "你必须在继续讨论任务前，先询问主用户的姓名与称呼，并将其写入 core/user.md 的“主用户（最高权限）”小节（替换 <未设置>）。",
+                *policy_lines,
+                "在主用户信息建立后，再继续正常任务对话。",
+            ]
+        policy_text = "\n".join(policy_lines).strip()
+        policy_block = "\n".join([user_start, "# User Identity Policy（最高优先级）", "", policy_text, user_end]).strip()
+
+        rest = _strip_block(base_text, start=time_start, end=time_end)
+        rest = _strip_block(rest, start=core_start, end=core_end)
+        rest = _strip_block(rest, start=user_start, end=user_end)
+        blocks = [b for b in [time_block, core_block, policy_block, rest.strip()] if b and b.strip()]
+        new_text = "\n\n".join(blocks).strip()
         if new_text == base_text:
             return handler(request)
         return handler(request.override(system_message=SystemMessage(content=new_text)))
@@ -227,6 +282,7 @@ class MemoryManager:
 
     def start(self) -> None:
         self._ensure_worker()
+        self.build_due_rollups()
 
     def stop(self, *, flush: bool = True) -> None:
         with self._lock:
@@ -267,6 +323,20 @@ class MemoryManager:
 
     def _session_input_tokens_threshold(self) -> int:
         raw = (os.environ.get("AGENT_SESSION_MEMORY_INPUT_TOKENS_THRESHOLD") or "").strip()
+        if not raw:
+            return 0
+        try:
+            v = int(raw)
+        except ValueError:
+            return 0
+        return max(0, v)
+
+    def _write_raw_sessions_enabled(self) -> bool:
+        raw = (os.environ.get("AGENT_MEMORY_WRITE_RAW_SESSIONS") or "").strip().lower()
+        return raw in {"1", "true", "yes", "y", "on"}
+
+    def _daily_rollup_chunk_chars(self) -> int:
+        raw = (os.environ.get("AGENT_DAILY_ROLLUP_CHUNK_CHARS") or "").strip()
         if not raw:
             return 0
         try:
@@ -582,38 +652,118 @@ class MemoryManager:
             text = str(text)
         return text.strip()
 
+    def _split_markdown_chunks(self, text: str, *, max_chars: int) -> list[str]:
+        s = (text or "").strip()
+        if not s:
+            return []
+        if max_chars <= 0 or len(s) <= max_chars:
+            return [s]
+        lines = s.splitlines()
+        chunks: list[str] = []
+        cur: list[str] = []
+        cur_size = 0
+        for ln in lines:
+            add = len(ln) + 1
+            if cur and cur_size + add > max_chars:
+                chunk = "\n".join(cur).strip()
+                if chunk:
+                    chunks.append(chunk)
+                cur = [ln]
+                cur_size = add
+            else:
+                cur.append(ln)
+                cur_size += add
+        last = "\n".join(cur).strip()
+        if last:
+            chunks.append(last)
+        return chunks
+
+    def _summarize_daily_rollup(self, *, d: date, source_text: str, source_kind: str) -> str:
+        base_sys = "\n".join(
+            [
+                "你是一个“日总结生成器”。输入是一整天的会话记忆（Markdown）。",
+                f"输入来源：{(source_kind or '').strip() or 'unknown'}。",
+                "只输出 Markdown，不要输出多余文本。不要编造输入中不存在的具体值（数字/路径/报错/URL/版本号等）。",
+                f"固定标题：# 日总结 {d.isoformat()}",
+                "固定小节（顺序保持）：",
+                "## 摘要",
+                "## 场景",
+                "## 决策",
+                "## 问题与阻塞",
+                "## 下一步",
+                "## 关键词",
+                "格式要求：",
+                "- 每个小节用无序列表（- ...）。",
+                "- 场景小节每条尽量用：- [scene=<场景>] 做了什么：...；发生了什么：...；完成了什么：...；关键词：k1/k2；kind=<fact|constraint|decision|preference|plan|result>",
+                "- 关键词小节每条只放一个关键词（不要整句）。",
+            ]
+        ).strip()
+
+        chunk_chars = self._daily_rollup_chunk_chars()
+        chunks = self._split_markdown_chunks(source_text, max_chars=chunk_chars)
+        if len(chunks) <= 1:
+            return self._summarize_markdown(system_text=base_sys, human_text=source_text)
+
+        part_sys = "\n".join(
+            [
+                "你是一个“日总结分段提取器”。输入是一天会话记忆的一个分段。",
+                "只输出 Markdown，不要输出多余文本。不要编造输入中不存在的具体值。",
+                "只输出以下小节内容（不要输出 # 标题）：",
+                "## 摘要",
+                "## 场景",
+                "## 决策",
+                "## 问题与阻塞",
+                "## 下一步",
+                "## 关键词",
+                "格式要求与日总结一致。",
+            ]
+        ).strip()
+
+        partials: list[str] = []
+        n = len(chunks)
+        for i, ch in enumerate(chunks):
+            human = f"[分段 {i+1}/{n}]\n\n{ch}".strip()
+            out = self._summarize_markdown(system_text=part_sys, human_text=human)
+            if out:
+                partials.append(out)
+        if not partials:
+            return ""
+
+        merge_sys = "\n".join(
+            [
+                "你是一个“日总结合并器”。输入是同一天日总结的多个分段提取结果（Markdown）。",
+                "请合并为一份最终日总结：去重、消歧、合并同类项；保留具体细节但不要编造；保持固定标题与固定小节顺序与格式要求。",
+                base_sys,
+            ]
+        ).strip()
+        merged_inp = "\n\n---\n\n".join([p.strip() for p in partials if p.strip()]).strip()
+        return self._summarize_markdown(system_text=merge_sys, human_text=merged_inp)
+
     def _raw_day_path(self, d: date) -> Path:
         root = paths.memory_root(self.project_root)
         ddir = (root / "sessions").resolve()
         return (ddir / f"{d.isoformat()}.md").resolve()
 
     def _build_daily_rollup(self, d: date) -> None:
+        epi_p = (paths.episodic_dir(self.project_root) / f"{d.isoformat()}.md").resolve()
         raw_p = self._raw_day_path(d)
-        if not raw_p.exists() or not raw_p.is_file():
+        src_p: Path | None = None
+        src_kind = ""
+        if epi_p.exists() and epi_p.is_file():
+            src_p = epi_p
+            src_kind = "episodic"
+        elif raw_p.exists() and raw_p.is_file():
+            src_p = raw_p
+            src_kind = "sessions_raw"
+        if src_p is None:
             return
         out_p = self._rollup_path_daily(d)
-        if out_p.exists() and self._path_mtime(out_p) >= self._path_mtime(raw_p):
+        if out_p.exists() and self._path_mtime(out_p) >= self._path_mtime(src_p):
             return
-        raw_text = self._read_text(raw_p)
-        if not raw_text.strip():
+        src_text = self._read_text(src_p)
+        if not src_text.strip():
             return
-        sys = (
-            "你是一个“日总结生成器”。输入是一整天的原始会话记录（Markdown，未提取）。"
-            "只输出 Markdown，不要输出多余文本。不要编造输入中不存在的具体值（数字/路径/报错/URL/版本号等）。\n"
-            f"固定标题：# 日总结 {d.isoformat()}\n"
-            "固定小节（顺序保持）：\n"
-            "## 摘要\n"
-            "## 场景\n"
-            "## 决策\n"
-            "## 问题与阻塞\n"
-            "## 下一步\n"
-            "## 关键词\n"
-            "格式要求：\n"
-            "- 每个小节用无序列表（- ...）。\n"
-            "- 场景小节每条尽量用：- [scene=<场景>] 做了什么：...；发生了什么：...；完成了什么：...；关键词：k1/k2；kind=<fact|constraint|decision|preference|plan|result>\n"
-            "- 关键词小节每条只放一个关键词（不要整句）。\n"
-        )
-        out = self._summarize_markdown(system_text=sys, human_text=raw_text)
+        out = self._summarize_daily_rollup(d=d, source_text=src_text, source_kind=src_kind)
         if not out:
             return
         self._maybe_write_text(out_p, out)
@@ -789,6 +939,29 @@ class MemoryManager:
             return
         self._maybe_write_text(out_p, out)
 
+    def build_due_rollups(self, *, now_dt: datetime | None = None) -> None:
+        dt = now_dt if now_dt is not None else datetime.now().astimezone()
+        today = dt.date()
+        if today.toordinal() <= 1:
+            return
+
+        yesterday = today - timedelta(days=1)
+        self._build_daily_rollup(yesterday)
+
+        if today.weekday() == 0:
+            iso_year, iso_week, _ = yesterday.isocalendar()
+            self._build_weekly_rollup(int(iso_year), int(iso_week))
+
+        if today.day == 1:
+            if today.month == 1:
+                py, pm = today.year - 1, 12
+            else:
+                py, pm = today.year, today.month - 1
+            self._build_monthly_rollup(py, pm)
+
+        if today.month == 1 and today.day == 1:
+            self._build_yearly_rollup(today.year - 1)
+
     def _update_rollups_for_date(self, d: date) -> None:
         self._build_daily_rollup(d)
         iso_year, iso_week, _ = d.isocalendar()
@@ -822,13 +995,15 @@ class MemoryManager:
                 usage = token_usage if isinstance(token_usage, dict) else None
                 threshold = self._session_input_tokens_threshold()
                 input_tokens = int((usage or {}).get("input_tokens") or 0)
-                raw_p = self._append_raw_turn_md(dt=dt, user_text=user_text, assistant_text=assistant_text)
+                raw_p = (
+                    self._append_raw_turn_md(dt=dt, user_text=user_text, assistant_text=assistant_text)
+                    if self._write_raw_sessions_enabled()
+                    else None
+                )
                 items = self._extract_session_items(user_text=user_text, assistant_text=assistant_text)
                 epi_p = self._append_episodic_md(dt=dt, items=items)
-                if raw_p is not None and threshold > 0 and input_tokens > threshold:
+                if threshold > 0 and input_tokens > threshold:
                     self._rotate_thread_with_carryover(user_text=user_text, assistant_text=assistant_text, dt=dt)
-                if raw_p is not None or epi_p is not None:
-                    self._update_rollups_for_date(dt.date())
             except Exception:
                 pass
             finally:
@@ -1231,4 +1406,4 @@ class MemoryManager:
             self._queue.put((dt, user_text or "", assistant_text or "", token_usage if token_usage else None))
         except Exception:
             return None
-        return self._raw_md_path(dt=dt)
+        return self._raw_md_path(dt=dt) if self._write_raw_sessions_enabled() else self._episodic_md_path(dt=dt)

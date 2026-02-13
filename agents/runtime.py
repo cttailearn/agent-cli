@@ -563,11 +563,28 @@ def _init_model(model_name: str):
         deepseek_model_name = normalized_model.split(":", 1)[1]
         return ChatDeepSeekThinkingTools(model=deepseek_model_name, streaming=True)
     try:
+        if normalized_model.startswith("openai:"):
+            try:
+                return init_chat_model(
+                    model=normalized_model,
+                    streaming=True,
+                    model_kwargs={"stream_options": {"include_usage": True}},
+                )
+            except TypeError:
+                return init_chat_model(model=normalized_model, streaming=True)
         return init_chat_model(model=normalized_model, streaming=True)
     except ValueError as e:
         if "Unable to infer model provider" not in str(e):
             raise
-        return init_chat_model(model=normalized_model, model_provider="openai", streaming=True)
+        try:
+            return init_chat_model(
+                model=normalized_model,
+                model_provider="openai",
+                streaming=True,
+                model_kwargs={"stream_options": {"include_usage": True}},
+            )
+        except TypeError:
+            return init_chat_model(model=normalized_model, model_provider="openai", streaming=True)
 
 
 def build_agent(

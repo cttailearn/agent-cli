@@ -26,6 +26,7 @@ from agents.runtime import (
     _stream_text_delta,
 )
 from agents.tools import action_log_snapshot, actions_since, action_scope, delete_path, list_dir, read_file, run_cli
+from config_manager import apply_config_to_environ, list_models, load_config, set_active_model, set_active_workspace
 
 
 _COMPLETION_CLAIM_RE = re.compile(
@@ -412,11 +413,14 @@ def handle_local_command(
                     "- /cd <path>                  切换工作目录（限制在项目目录内）",
                     "- /history [n]                查看历史输入（默认 20）",
                     "- /tools                      查看可用工具概览",
+                    "- /models [list|<name>]       列出/切换模型（自动热更新）",
+                    "- /ws [list|<name>]           列出/切换输出工作空间（out/<ws>/）",
                     "- /skills                     查看技能目录",
                     "- /last [k]                   查看最近输出（k=actions/tools/skills/all）",
                     "- /verbose <on|off>           开关工具输出显示",
                     "- /reset                      清空对话与历史",
                     "- /quit                       退出",
+                    "- 用户识别提示：首次启动会让助手询问姓名并写入 memory/user.md",
                     "- !<command>                  直接执行命令（在 work_dir 下）",
                 ]
             )
@@ -537,6 +541,85 @@ def handle_local_command(
             )
         )
         return "continue"
+
+    def _cfg_path() -> Path:
+        raw = (os.environ.get("AGENT_CONFIG_PATH") or "agent.json").strip()
+        try:
+            return Path(raw).expanduser().resolve()
+        except Exception:
+            return Path(raw)
+
+    def _sanitize_ws(raw: str) -> str:
+        name = (raw or "").strip()
+        if not name:
+            return "default"
+        p = Path(name)
+        if p.is_absolute() or ".." in p.parts:
+            return "default"
+        cleaned = re.sub(r"[^A-Za-z0-9._/-]+", "_", name).strip("/").strip()
+        return cleaned or "default"
+
+    if cmd in {"models", "model"}:
+        p = _cfg_path()
+        cfg = load_config(p) or {}
+        active_key = (cfg.get("active_model") or cfg.get("model") or "").strip() if isinstance(cfg, dict) else ""
+        if not args or args[0].lower() in {"list", "ls"}:
+            items = list_models(cfg) if isinstance(cfg, dict) else []
+            lines = [f"config: {p.as_posix()}", f"active: {active_key or '(none)'}"]
+            if not items:
+                lines.append("models: (none)")
+            else:
+                lines.append("models:")
+                for k, m in items:
+                    mark = "*" if k == active_key else " "
+                    lines.append(f"{mark} {k} -> {m or '(missing model)'}")
+            print("\n".join(lines))
+            return "continue"
+        target = args[0].strip()
+        if not target:
+            print("用法：/models [list|<name>]")
+            return "continue"
+        cfg2 = set_active_model(p, target)
+        apply_config_to_environ(cfg2, override=True)
+        print(f"已切换模型：{target} -> {os.environ.get('LC_MODEL', '').strip()}")
+        print("正在重建运行时（切换模型），请稍候...", flush=True)
+        return "rebuild"
+
+    if cmd in {"ws", "workspace"}:
+        p = _cfg_path()
+        cfg = load_config(p) or {}
+        base = (os.environ.get("AGENT_OUTPUT_BASE_DIR") or "").strip()
+        try:
+            base_dir = Path(base).expanduser().resolve() if base else Path(os.environ.get("AGENT_OUTPUT_DIR", ".")).resolve()
+        except Exception:
+            base_dir = Path(".").resolve()
+        current = (os.environ.get("AGENT_OUTPUT_WORKSPACE") or "").strip()
+        if not args or args[0].lower() in {"list", "ls"}:
+            lines = [f"output_base: {base_dir.as_posix()}", f"workspace: {current or '(none)'}"]
+            try:
+                if base_dir.exists() and base_dir.is_dir():
+                    wss = [d.name for d in base_dir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+                    wss = sorted(wss, key=lambda x: x.lower())
+                    if wss:
+                        lines.append("available:")
+                        lines.extend([f"- {w}" for w in wss[:50]])
+                        if len(wss) > 50:
+                            lines.append("...(truncated)")
+            except Exception:
+                pass
+            print("\n".join(lines))
+            return "continue"
+        target = _sanitize_ws(args[0])
+        cfg2 = set_active_workspace(p, target)
+        apply_config_to_environ(cfg2, override=True)
+        os.environ["AGENT_OUTPUT_WORKSPACE"] = target
+        try:
+            os.environ["AGENT_OUTPUT_DIR"] = str((base_dir / target).resolve())
+        except Exception:
+            os.environ["AGENT_OUTPUT_DIR"] = str(base_dir / target)
+        print(f"已切换输出工作空间：{target}")
+        print("正在重建运行时（切换输出工作空间），请稍候...", flush=True)
+        return "rebuild"
 
     if cmd in {"skills"}:
         if not state.skill_catalog_text:

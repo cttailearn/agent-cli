@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 from memory.manager import MemoryManager
@@ -13,6 +14,7 @@ from .scheduler import SystemScheduler
 from .schedules import DailyAtSchedule, IntervalSchedule, ManualSchedule, OneShotSchedule, Schedule
 from .tasks import (
     AgentReminderTask,
+    MemoryRollupTask,
     ObserverPromptTask,
     SystemContext,
     SystemTask,
@@ -31,6 +33,42 @@ def set_global_system_manager(manager: "SystemManager | None") -> None:
 def get_global_system_manager() -> "SystemManager | None":
     with _GLOBAL_MANAGER_LOCK:
         return _GLOBAL_MANAGER
+
+
+def _local_tzinfo():
+    return datetime.now().astimezone().tzinfo
+
+
+def _ts_to_iso(ts: float) -> str:
+    dt = datetime.fromtimestamp(float(ts), tz=_local_tzinfo())
+    return dt.isoformat(sep=" ", timespec="seconds")
+
+
+def _parse_datetime_to_ts(value: object) -> float | None:
+    if isinstance(value, (int, float)):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except Exception:
+        pass
+    s2 = s.replace(" ", "T")
+    if s2.endswith("Z"):
+        s2 = s2[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s2)
+    except Exception:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_local_tzinfo())
+    try:
+        return float(dt.timestamp())
+    except Exception:
+        return None
 
 
 class SystemManager:
@@ -79,8 +117,8 @@ class SystemManager:
         now_ts = time.time()
         item = {
             "id": rid,
-            "run_ts": float(run_ts),
-            "created_ts": float(now_ts),
+            "run_at": _ts_to_iso(float(run_ts)),
+            "created_at": _ts_to_iso(float(now_ts)),
             "status": "scheduled",
             "message": msg,
         }
@@ -126,7 +164,7 @@ class SystemManager:
                         continue
                     if (it.get("id") or "") == rid and (it.get("status") or "") == "scheduled":
                         it["status"] = "canceled"
-                        it["canceled_ts"] = float(time.time())
+                        it["canceled_at"] = _ts_to_iso(time.time())
                         changed = True
             if changed:
                 self._reminders_save(state)
@@ -147,8 +185,11 @@ class SystemManager:
             rid = it.get("id")
             if not isinstance(rid, str) or not rid.strip():
                 continue
-            out.append(dict(it))
-        out.sort(key=lambda x: float(x.get("run_ts") or 0.0))
+            normalized = self._normalize_reminder_item(it)
+            if normalized is None:
+                continue
+            out.append(normalized)
+        out.sort(key=lambda x: float(_parse_datetime_to_ts(x.get("run_at")) or 0.0))
         return out
 
     def _load_tasks(self) -> list[SystemTask]:
@@ -190,10 +231,16 @@ class SystemManager:
                         prompt=prompt,
                     )
                 )
+            if kind == "memory_rollup":
+                tasks.append(
+                    MemoryRollupTask(
+                        id=spec.id,
+                        schedule=build_schedule(spec),
+                    )
+                )
         return tasks
 
     def _load_reminder_tasks(self) -> list[SystemTask]:
-        now_ts = time.time()
         with self._reminders_lock:
             state = self._reminders_load()
         items = state.get("items")
@@ -213,9 +260,10 @@ class SystemManager:
                 continue
             if not isinstance(msg, str) or not msg.strip():
                 continue
-            try:
-                t = float(run_ts)
-            except Exception:
+            t = _parse_datetime_to_ts(it.get("run_at"))
+            if t is None:
+                t = _parse_datetime_to_ts(run_ts)
+            if t is None:
                 continue
             tasks.append(
                 AgentReminderTask(
@@ -226,6 +274,51 @@ class SystemManager:
                 )
             )
         return tasks
+
+    def _normalize_reminder_item(self, it: dict[str, object]) -> dict[str, object] | None:
+        rid = it.get("id")
+        if not isinstance(rid, str) or not rid.strip():
+            return None
+        msg = it.get("message")
+        status = it.get("status")
+        run_ts = _parse_datetime_to_ts(it.get("run_at"))
+        if run_ts is None:
+            run_ts = _parse_datetime_to_ts(it.get("run_ts"))
+        if run_ts is None:
+            return None
+
+        created = it.get("created_at")
+        if not isinstance(created, str) or not created.strip():
+            created_ts = _parse_datetime_to_ts(it.get("created_ts"))
+            created = _ts_to_iso(created_ts) if created_ts is not None else ""
+
+        out: dict[str, object] = {
+            "id": rid.strip(),
+            "run_at": _ts_to_iso(run_ts),
+            "created_at": created.strip() if isinstance(created, str) else "",
+            "status": (status or "").strip() if isinstance(status, str) else str(status or "").strip(),
+            "message": msg.strip() if isinstance(msg, str) else "",
+        }
+
+        canceled = it.get("canceled_at")
+        if not isinstance(canceled, str) or not canceled.strip():
+            canceled_ts = _parse_datetime_to_ts(it.get("canceled_ts"))
+            canceled = _ts_to_iso(canceled_ts) if canceled_ts is not None else ""
+        if isinstance(canceled, str) and canceled.strip():
+            out["canceled_at"] = canceled.strip()
+
+        triggered = it.get("triggered_at")
+        if not isinstance(triggered, str) or not triggered.strip():
+            triggered_ts = _parse_datetime_to_ts(it.get("triggered_ts"))
+            triggered = _ts_to_iso(triggered_ts) if triggered_ts is not None else ""
+        if isinstance(triggered, str) and triggered.strip():
+            out["triggered_at"] = triggered.strip()
+
+        last_output = it.get("last_output")
+        if isinstance(last_output, str) and last_output.strip():
+            out["last_output"] = last_output.strip()
+
+        return out
 
     def _reminders_load(self) -> dict[str, object]:
         p = self._reminders_path if self._reminders_path.exists() else self._legacy_reminders_path
@@ -244,9 +337,20 @@ class SystemManager:
         return raw
 
     def _reminders_save(self, state: dict[str, object]) -> None:
+        items_in = state.get("items")
+        normalized_items: list[dict[str, object]] = []
+        if isinstance(items_in, list):
+            for it in items_in:
+                if not isinstance(it, dict):
+                    continue
+                norm = self._normalize_reminder_item(it)
+                if norm is None:
+                    continue
+                normalized_items.append(norm)
+        state_out: dict[str, object] = {"version": 2, "items": normalized_items}
         p = self._reminders_path
         self._reminders_dir.mkdir(parents=True, exist_ok=True)
-        p.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        p.write_text(json.dumps(state_out, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
 
     def _reminder_mark_done(self, reminder_id: str, final_text: str) -> None:
         rid = (reminder_id or "").strip()
@@ -264,7 +368,7 @@ class SystemManager:
                     if (it.get("status") or "") != "scheduled":
                         continue
                     it["status"] = "done"
-                    it["triggered_ts"] = float(time.time())
+                    it["triggered_at"] = _ts_to_iso(time.time())
                     out = (final_text or "").strip()
                     if len(out) > 2000:
                         out = out[:2000]
@@ -274,11 +378,8 @@ class SystemManager:
 
     def _migrate_legacy_reminders(self) -> None:
         try:
-            if self._reminders_path.exists():
-                return
-            if not self._legacy_reminders_path.exists():
-                return
-            state = self._reminders_load()
-            self._reminders_save(state)
+            if self._reminders_path.exists() or self._legacy_reminders_path.exists():
+                state = self._reminders_load()
+                self._reminders_save(state)
         except Exception:
             return

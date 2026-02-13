@@ -8,29 +8,34 @@
 
 **项目状态**：代码结构清晰，模块化程度高，处于活跃开发阶段。
 
-## 1.1 环境变量（.env）
+## 1.1 配置文件（agent.json）
 
-项目入口会在启动时自动加载 `.env`（见 [main.py](file:///g:/AI/agent-cli/main.py#L16)）。本项目默认 `.env` 已被 `.gitignore` 忽略，避免误提交密钥（见 [.gitignore](file:///g:/AI/agent-cli/.gitignore#L1-L12)）。
+项目入口使用 **JSON 配置文件** 作为唯一配置来源：默认读取仓库根目录下的 [agent.json](file:///d:/tools/agent-cli/agent.json)。
 
-你可以直接使用仓库根目录下生成的 [.env](file:///g:/AI/agent-cli/.env) 作为模板修改；CLI 参数的优先级高于 `.env` 环境变量。
+- 配置文件路径：可通过环境变量 `AGENT_CONFIG_PATH` 指定（例如 `AGENT_CONFIG_PATH=D:\\tools\\agent-cli\\agent.json`）
+- 交互模式下支持热更新：修改 `agent.json` 后无需重启，下一轮输入前会自动检测并重载
+- 密钥不要写入仓库文件：推荐在 `agent.json` 中使用 `${OPENAI_API_KEY}` / `${DEEPSEEK_API_KEY}` 引用系统环境变量
 
 ### 1.1.1 基础路径配置（main.py）
 
 - `AGENT_PROJECT_DIR`：智能体根目录（工作区根）；为空时默认 `main.py` 同级目录下的 `workspace/`（启动时自动创建，见 [main.py](file:///d:/tools/agent-cli/main.py#L59-L64)）。
-- `AGENT_OUTPUT_DIR`：输出目录；默认 `out`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L67-L72)）。
+- `AGENT_OUTPUT_DIR`：输出**基目录**；默认 `out`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L67-L72)）。
+- `output.workspace` / `AGENT_OUTPUT_WORKSPACE`：输出工作空间名；最终输出目录为 `{AGENT_OUTPUT_DIR}/{workspace}/`（可在交互中用 `/ws <name>` 切换）。
 - `AGENT_WORK_DIR`：命令执行工作目录；默认等同智能体根目录（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L74-L81)）。
 - `AGENT_SKILLS_DIR`：项目技能目录；默认 `skills`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L21-L25)）。
 - `AGENT_SKILLS_DIRS`：技能目录列表（`;` 或 `,` 分隔）；相对路径均按智能体根目录解析；不填则只使用 `AGENT_SKILLS_DIR`（并自动追加内置技能目录与全局技能目录，见 [main.py](file:///d:/tools/agent-cli/main.py#L106-L124)）。
 
-### 1.1.2 模型配置
+### 1.1.2 模型配置（agent.json）
 
-- `LC_MODEL`：模型名称（默认 `deepseek:deepseek-reasoner`，见 [main.py](file:///g:/AI/agent-cli/main.py#L47-L50)）。
-  - `deepseek:*`：走 DeepSeek 初始化（见 [runtime.py](file:///g:/AI/agent-cli/agents/runtime.py#L270-L280)）。
-  - 带 Provider 前缀（例如 `openai:gpt-4o-mini`）：走 LangChain 通用 `init_chat_model`。
-  - 不带 Provider 前缀（例如 `moonshotai/Kimi-K2.5`）：默认按 OpenAI 兼容接口处理（自动回退为 `model_provider="openai"`），只需要配置 `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `LC_MODEL` 即可（见 [runtime.py](file:///g:/AI/agent-cli/agents/runtime.py#L270-L283) 与 [model.py](file:///g:/AI/agent-cli/memory/model.py#L20-L31)）。
-- `DEEPSEEK_API_KEY`：DeepSeek API Key（供 `langchain-deepseek` 使用；项目代码不直接读取，但运行 DeepSeek 模型通常需要它）。
-- `OPENAI_API_KEY`：OpenAI API Key（供 OpenAI/兼容 OpenAI 接口使用）。
-- `OPENAI_BASE_URL`：OpenAI 兼容接口的 Base URL（例如 `https://xxx/v1`；使用官方 OpenAI 可不填或设为 `https://api.openai.com/v1`）。
+模型由 `agent.json` 的 `models` + `active_model` 管理，并提供交互命令热切换：
+
+- `/models list`：列出模型列表与当前激活项
+- `/models <name>`：切换到指定模型（会写回 `agent.json` 并自动重建运行时，无需重启）
+
+模型写法示例：
+
+- DeepSeek：`"model": "deepseek:deepseek-chat"`，并在该模型的 `env` 中提供 `DEEPSEEK_API_KEY`
+- OpenAI/兼容 OpenAI：`"model": "openai:gpt-4o-mini"`，并在该模型的 `env` 中提供 `OPENAI_API_KEY`；如需第三方兼容服务，额外提供 `OPENAI_BASE_URL`
 
 ### 1.1.3 MCP 配置
 
@@ -83,7 +88,7 @@ agent-cli/
     ├── .agents/                 # 运行时状态（技能状态等）
     ├── mcp/                     # MCP 配置（默认读取 workspace/mcp/config.json）
     ├── memory/                  # 记忆存储
-    ├── out/                     # 输出目录
+    ├── out/                     # 输出基目录（实际输出在 out/<workspace>/ 下）
     └── skills/                  # 项目技能目录（默认读取 workspace/skills/）
 ```
 
@@ -234,7 +239,7 @@ agent-cli/
 - **文件操作**：`read_file`、`write_file`、`write_project_file`、`delete_path`、`list_dir`
 - **命令执行**：`Bash`、`run_cli`（支持超时和流式输出）
 - **记忆操作**：`memory_core_read`、`memory_core_append`、`memory_core_write`、`memory_kg_recall` 等
-- **安全限制**：禁止访问敏感文件（`.env`、`.git`、密钥文件等），禁止越权访问项目根目录之外
+- **安全限制**：禁止访问敏感文件（`agent.json`、`.env`、`.git`、密钥文件等），禁止越权访问项目根目录之外
 - **操作日志**：所有工具调用记录到 `ACTION_LOG`，用于终端显示和调试
 - **调用约定**：优先使用 `tool.invoke({...})`；同时兼容 `tool(**kwargs)` / `tool(dict)` 形式
 

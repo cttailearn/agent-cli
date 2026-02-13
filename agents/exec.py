@@ -93,6 +93,20 @@ def _is_under_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _is_under_any_root(path: Path, roots: list[Path]) -> bool:
+    try:
+        p = path.resolve()
+    except Exception:
+        p = path
+    for r in roots:
+        try:
+            p.relative_to(r.resolve())
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _extract_abs_paths(command: str) -> list[str]:
     c = command or ""
     patterns = [
@@ -180,7 +194,7 @@ def _find_script_path(tokens: list[str], cwd: Path) -> Path | None:
     return None
 
 
-def _validate_script_text(script_text: str, work_root: Path) -> str | None:
+def _validate_script_text(script_text: str, allowed_roots: list[Path]) -> str | None:
     if not script_text:
         return None
     for rx in _DANGEROUS_COMMAND_PATTERNS:
@@ -191,17 +205,23 @@ def _validate_script_text(script_text: str, work_root: Path) -> str | None:
             p = Path(raw).expanduser()
             if not p.is_absolute():
                 continue
-            if not _is_under_root(p, work_root):
+            if not _is_under_any_root(p, allowed_roots):
                 return f"absolute_path_outside_work_root_in_script:{p.resolve().as_posix()}"
         except Exception:
             return f"invalid_path_in_script:{raw}"
     return None
 
 
-def sandbox_validate_command(*, command: str, work_root: Path, cwd: Path) -> str | None:
+def sandbox_validate_command(*, command: str, work_root: Path, cwd: Path, extra_roots: list[Path] | None = None) -> str | None:
     mode = (os.environ.get("AGENT_SANDBOX") or "off").strip().lower()
     if mode in {"0", "off", "false", "no"}:
         return None
+    allowed_roots = [work_root.resolve()]
+    for r in extra_roots or []:
+        try:
+            allowed_roots.append(r.resolve())
+        except Exception:
+            continue
 
     cmd = (command or "").strip()
     if not cmd:
@@ -216,7 +236,7 @@ def sandbox_validate_command(*, command: str, work_root: Path, cwd: Path) -> str
             p = Path(raw).expanduser()
             if not p.is_absolute():
                 continue
-            if not _is_under_root(p, work_root):
+            if not _is_under_any_root(p, allowed_roots):
                 return f"absolute_path_outside_work_root:{p.resolve().as_posix()}"
         except Exception:
             return f"invalid_path:{raw}"
@@ -239,18 +259,18 @@ def sandbox_validate_command(*, command: str, work_root: Path, cwd: Path) -> str
                 candidate = p
             else:
                 candidate = (cwd / p)
-            if not _is_under_root(candidate, work_root):
+            if not _is_under_any_root(candidate, allowed_roots):
                 return f"path_escape_attempt:{raw_tok}"
         except Exception:
             return f"invalid_path_token:{raw_tok}"
 
     script_path = _find_script_path(tokens, cwd)
     if script_path is not None:
-        if not _is_under_root(script_path, work_root):
+        if not _is_under_any_root(script_path, allowed_roots):
             return f"script_outside_work_root:{script_path.as_posix()}"
         script_text = _safe_read_script_text(script_path)
         if script_text is not None:
-            deny = _validate_script_text(script_text, work_root)
+            deny = _validate_script_text(script_text, allowed_roots)
             if deny:
                 return deny
     return None
@@ -523,10 +543,24 @@ class ExecTool(BaseTool):
             cwd_path = cwd_path.resolve()
         except OSError:
             cwd_path = work_root
-        if not _is_under_root(cwd_path, work_root):
-            return {"status": "denied", "reason": "cwd_outside_work_root", "cwd": cwd_path.as_posix()}
+        extra_roots: list[Path] = []
+        raw_extra = (os.environ.get("AGENT_EXTRA_CWD_ROOTS") or "").strip()
+        if raw_extra:
+            for s in re.split(r"[;,\n]+", raw_extra):
+                ss = (s or "").strip()
+                if not ss:
+                    continue
+                try:
+                    p = Path(ss).expanduser()
+                    if not p.is_absolute():
+                        continue
+                    extra_roots.append(p.resolve())
+                except Exception:
+                    continue
+        if not _is_under_any_root(cwd_path, [work_root, *extra_roots]):
+            return {"status": "denied", "reason": "cwd_outside_allowed_roots", "cwd": cwd_path.as_posix()}
 
-        deny_reason = sandbox_validate_command(command=params.command, work_root=work_root, cwd=cwd_path)
+        deny_reason = sandbox_validate_command(command=params.command, work_root=work_root, cwd=cwd_path, extra_roots=extra_roots)
         if deny_reason:
             return {"status": "denied", "reason": deny_reason, "cwd": cwd_path.as_posix()}
 

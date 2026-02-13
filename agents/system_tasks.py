@@ -14,6 +14,13 @@ class AgentSystemTaskSpec:
 
 SYSTEM_TASK_SPECS: list[AgentSystemTaskSpec] = [
     AgentSystemTaskSpec(
+        id="memory_rollups_due",
+        schedule_type="daily_at",
+        schedule_args={"hour": 0, "minute": 0, "second": 5},
+        kind="memory_rollup",
+        payload={},
+    ),
+    AgentSystemTaskSpec(
         id="observer_daily_wrapup",
         schedule_type="daily_at",
         schedule_args={"hour": 23, "minute": 59, "second": 0},

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
@@ -83,3 +84,13 @@ class AgentReminderTask(SystemTask):
             except Exception:
                 pass
         return final_text
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryRollupTask(SystemTask):
+    id: str
+    schedule: Schedule
+
+    def run(self, ctx: SystemContext) -> str:
+        ctx.memory_manager.build_due_rollups(now_dt=datetime.now().astimezone())
+        return "OK"

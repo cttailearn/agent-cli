@@ -98,6 +98,7 @@ except Exception:
 
 
 _SENSITIVE_FILENAMES = {
+    "agent.json",
     ".env",
     ".env.local",
     ".env.development",
@@ -171,6 +172,45 @@ def _resolve_under_root(root: Path, path: str) -> tuple[Path | None, str | None]
     return resolved_target, None
 
 
+def _parse_root_list_env(var_name: str) -> list[Path]:
+    raw = (os.environ.get(var_name) or "").strip()
+    if not raw:
+        return []
+    parts = [s.strip() for s in re.split(r"[;,\n]+", raw) if s.strip()]
+    roots: list[Path] = []
+    for s in parts:
+        try:
+            p = Path(s).expanduser()
+            if not p.is_absolute():
+                continue
+            roots.append(p.resolve())
+        except Exception:
+            continue
+    uniq: list[Path] = []
+    seen: set[str] = set()
+    for r in roots:
+        key = r.as_posix().lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(r)
+    return uniq
+
+
+def _is_under_any_root(path: Path, roots: list[Path]) -> bool:
+    try:
+        p = path.resolve()
+    except Exception:
+        p = path
+    for r in roots:
+        try:
+            p.relative_to(r)
+            return True
+        except Exception:
+            continue
+    return False
+
+
 def _is_sensitive_path(path: Path) -> bool:
     if any(part == ".git" for part in path.parts):
         return True
@@ -228,10 +268,11 @@ def write_file(path: str, content: str, mode: str = "w", encoding: str = "utf-8"
     except OSError as e:
         return f"Invalid path: {path}. Error: {e}"
 
-    try:
-        resolved_target.relative_to(output_root)
-    except ValueError:
-        return f"Refusing to write outside output directory: {resolved_target.as_posix()}"
+    extra_write_roots = _parse_root_list_env("AGENT_EXTRA_WRITE_ROOTS")
+    if not _is_under_any_root(resolved_target, [output_root, *extra_write_roots]):
+        return f"Refusing to write outside allowed roots: {resolved_target.as_posix()}"
+    if _is_sensitive_path(resolved_target):
+        return f"Refusing to write sensitive path: {resolved_target.as_posix()}"
 
     resolved_target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -964,12 +1005,16 @@ def run_cli(
         resolved_cwd = target_cwd.resolve()
     except OSError as e:
         return f"Invalid cwd: {cwd}. Error: {e}"
-    try:
-        resolved_cwd.relative_to(work_root)
-    except ValueError:
-        return f"Refusing to run outside work directory: {resolved_cwd.as_posix()}"
+    extra_cwd_roots = _parse_root_list_env("AGENT_EXTRA_CWD_ROOTS")
+    if not _is_under_any_root(resolved_cwd, [work_root, *extra_cwd_roots]):
+        return f"Refusing to run outside allowed roots: {resolved_cwd.as_posix()}"
 
-    deny_reason = sandbox_validate_command(command=command, work_root=work_root, cwd=resolved_cwd)
+    deny_reason = sandbox_validate_command(
+        command=command,
+        work_root=work_root,
+        cwd=resolved_cwd,
+        extra_roots=extra_cwd_roots,
+    )
     if deny_reason:
         _log_action(
             {
@@ -2078,7 +2123,8 @@ def reminder_schedule_at(message: str, run_at: str, reminder_id: str = "") -> st
         rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id)
     except Exception as e:
         return f"Failed: {type(e).__name__}: {e}"
-    return json.dumps({"ok": True, "id": rid, "run_ts": ts}, ensure_ascii=False, sort_keys=True)
+    run_at_out = datetime.fromtimestamp(float(ts)).astimezone().isoformat(sep=" ", timespec="seconds")
+    return json.dumps({"ok": True, "id": rid, "run_at": run_at_out}, ensure_ascii=False, sort_keys=True)
 
 
 @tool
@@ -2090,10 +2136,22 @@ def reminder_schedule_in(message: str, delay_s: int = 60, reminder_id: str = "")
     if mgr is None:
         return "SystemManager is not available."
     try:
-        rid = mgr.reminder_create_in(delay_s=float(delay_s), message=message, reminder_id=reminder_id)
+        s = float(delay_s)
+    except Exception:
+        return "Invalid delay_s."
+    if s <= 0:
+        return "Invalid delay_s. Must be > 0."
+    ts = time.time() + s
+    try:
+        rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id)
     except Exception as e:
         return f"Failed: {type(e).__name__}: {e}"
-    return json.dumps({"ok": True, "id": rid, "delay_s": int(delay_s)}, ensure_ascii=False, sort_keys=True)
+    run_at_out = datetime.fromtimestamp(float(ts)).astimezone().isoformat(sep=" ", timespec="seconds")
+    return json.dumps(
+        {"ok": True, "id": rid, "run_at": run_at_out, "delay_s": int(s)},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 @tool
