@@ -20,6 +20,11 @@ from agents.tools import (
     edit_file,
     glob_paths,
     grep,
+    identity_auth,
+    identity_auth_clear,
+    identity_auth_status,
+    identity_memory_get,
+    identity_memory_set,
     list_dir,
     memory_core_append,
     memory_core_read,
@@ -52,12 +57,9 @@ def build_single_agent(
     skill_middleware: SkillMiddleware,
     memory_middleware,
     mcp_tools: list[object],
-    store,
     checkpointer,
 ):
     model = _init_model(model_name)
-    memory: dict[str, str] = {}
-    shared_context: dict[str, str] = {}
     skill_manager = SkillManager(skills_dirs=skills_dirs, project_root=project_root, work_dir=work_dir)
 
     tools: list[object] = []
@@ -133,92 +135,49 @@ def build_single_agent(
         return skill_manager.prune_disabled_from_project()
 
     @tool
-    def remember(key: str, value: str, runtime: ToolRuntime) -> str:
-        """Store a long-term memory item for the current user (shared across threads)."""
-        k = (key or "").strip()
-        if not k:
-            return "Missing key."
-        v = (value or "").strip()
-        store_obj = getattr(runtime, "store", None)
-        if store_obj is None:
-            memory[k] = v
-            return "OK"
-        store_obj.put((_runtime_user_id(runtime), "memories"), k, {"value": v})
+    def memory_identity_set(
+        confirmed: str = "true",
+        name: str = "",
+        role: str = "",
+        relation: str = "",
+        runtime: ToolRuntime = None,
+    ) -> str:
+        """Set identity confirmation and related fields for the current thread."""
+        tid = _runtime_thread_id(runtime) if runtime is not None else "default"
+        try:
+            from memory.manager import set_thread_identity
+        except Exception as e:
+            return f"Import failed: {e}"
+        set_thread_identity(
+            tid,
+            confirmed=(confirmed or "").strip(),
+            name=(name or "").strip(),
+            role=(role or "").strip(),
+            relation=(relation or "").strip(),
+        )
         return "OK"
 
     @tool
-    def recall(key: str, runtime: ToolRuntime) -> str:
-        """Recall a long-term memory item for the current user (shared across threads)."""
-        k = (key or "").strip()
-        if not k:
-            return "Missing key."
-        store_obj = getattr(runtime, "store", None)
-        if store_obj is None:
-            return memory.get(k, "")
-        item = store_obj.get((_runtime_user_id(runtime), "memories"), k)
-        if item is None:
+    def memory_identity_get(runtime: ToolRuntime = None) -> str:
+        """Get identity confirmation and related fields for the current thread."""
+        tid = _runtime_thread_id(runtime) if runtime is not None else "default"
+        try:
+            from memory.manager import get_thread_identity
+        except Exception as e:
+            return f"Import failed: {e}"
+        data = get_thread_identity(tid)
+        if not data:
             return ""
-        val = getattr(item, "value", None)
-        if isinstance(val, dict):
-            v = val.get("value")
-            return v if isinstance(v, str) else ""
-        return ""
-
-    @tool
-    def forget(key: str, runtime: ToolRuntime) -> str:
-        """Delete a long-term memory item for the current user (shared across threads)."""
-        k = (key or "").strip()
-        if not k:
-            return "Missing key."
-        store_obj = getattr(runtime, "store", None)
-        if store_obj is None:
-            return "OK" if memory.pop(k, None) is not None else "Not found."
-        store_obj.delete((_runtime_user_id(runtime), "memories"), k)
-        return "OK"
-
-    @tool
-    def shared_context_put(key: str, value: str, runtime: ToolRuntime) -> str:
-        """Store a shared context item for the current thread."""
-        k = (key or "").strip()
-        if not k:
-            return "Missing key."
-        v = (value or "").strip()
-        store_obj = getattr(runtime, "store", None)
-        if store_obj is None:
-            shared_context[k] = v
-            return "OK"
-        store_obj.put(("shared", _runtime_thread_id(runtime)), k, {"value": v})
-        return "OK"
-
-    @tool
-    def shared_context_get(key: str, runtime: ToolRuntime) -> str:
-        """Get a shared context item for the current thread."""
-        k = (key or "").strip()
-        if not k:
-            return "Missing key."
-        store_obj = getattr(runtime, "store", None)
-        if store_obj is None:
-            return shared_context.get(k, "")
-        item = store_obj.get(("shared", _runtime_thread_id(runtime)), k)
-        if item is None:
-            return ""
-        val = getattr(item, "value", None)
-        if isinstance(val, dict):
-            v = val.get("value")
-            return v if isinstance(v, str) else ""
-        return ""
-
-    @tool
-    def shared_context_forget(key: str, runtime: ToolRuntime) -> str:
-        """Delete a shared context item for the current thread."""
-        k = (key or "").strip()
-        if not k:
-            return "Missing key."
-        store_obj = getattr(runtime, "store", None)
-        if store_obj is None:
-            return "OK" if shared_context.pop(k, None) is not None else "Not found."
-        store_obj.delete(("shared", _runtime_thread_id(runtime)), k)
-        return "OK"
+        out: list[str] = []
+        if data.get("confirmed"):
+            out.append("identity_confirmed=true")
+        if data.get("role"):
+            out.append(f"identity_role={data.get('role')}")
+        if data.get("name"):
+            out.append(f"identity_name={data.get('name')}")
+        if data.get("relation"):
+            out.append(f"identity_relation={data.get('relation')}")
+        return "\n".join(out).strip()
 
     tools.extend(
         [
@@ -233,12 +192,13 @@ def build_single_agent(
             skills_install,
             skills_ensure,
             skills_prune_disabled,
-            remember,
-            recall,
-            forget,
-            shared_context_put,
-            shared_context_get,
-            shared_context_forget,
+            memory_identity_set,
+            memory_identity_get,
+            identity_auth,
+            identity_auth_status,
+            identity_auth_clear,
+            identity_memory_set,
+            identity_memory_get,
             system_time,
             reminder_schedule_at,
             reminder_schedule_in,
@@ -272,15 +232,15 @@ def build_single_agent(
     system_prompt = "\n\n".join(
         [
             BASE_SYSTEM_PROMPT,
-            "你是一个智能体（Agent）。你负责与用户对话、理解意图、规划步骤，并在需要时直接执行任务（读写文件、运行命令、调用工具）。",
+            "你是一个个人助理。",
             "当你与用户交互时，你必须先确认“正在与你交流的用户是谁”，并按其身份与权限进行差异化交互：",
             "身份等级：超级管理员（主用户）> 普通用户（其余所有用户）。",
             "0) 身份确认门禁：未完成身份确认前，只能使用“初始中性风格”与对方交流（中性称呼、无角色扮演、无私有称谓）；不得引用或遵循核心记忆里的身份/角色/语气/称呼设定。",
             "1) 若用户身份不明确：默认使用中性称呼（你/您好），优先询问对方希望的称呼，以及其与超级管理员的关系；在身份明确前，不做涉及账号/资金/隐私/删除覆盖/外部命令等高风险的关键决策与不可逆操作。",
-            "2) 身份确认完成后：你才可以读取并使用 core 记忆中的表达风格与称呼偏好，并且只采用与该用户匹配的部分；确认完成后必须调用 shared_context_put 写入 identity_confirmed=true，并写入 identity_name/identity_role/identity_relation 等稳定字段。",
+            "2) 身份确认完成后：你才可以读取并使用 core 记忆中的表达风格与称呼偏好，并且只采用与该用户匹配的部分；在对方同意后调用 identity_auth 建立/续期时效身份态；再用 memory_identity_set 写入 identity_name/identity_role/identity_relation 等稳定字段。",
             "3) 若确认是超级管理员：以超级管理员偏好为最高优先级，默认可以推进任务；但遇到高风险操作仍需明确告知影响、给出可替代方案，并在执行前再次确认。",
             "4) 若确认是普通用户：在不违背超级管理员既有决策与边界的前提下提供帮助；对敏感信息与越权请求（例如读取私人文件、导出记忆、执行破坏性命令等）应拒绝或降级为通用步骤，并要求提供超级管理员的明确授权。",
-            "5) 若用户声称身份与记忆不一致：立刻降级回初始中性风格，先澄清再行动，并调用 shared_context_put 将 identity_confirmed=false。",
+            "5) 若用户声称身份与记忆不一致：立刻降级回初始中性风格，先澄清再行动，并调用 identity_auth_clear 使身份态失效。",
             "关于模型信息：你无法通过推理/能力特征/时间背景来确认底层模型供应商或具体版本。严禁臆测或声称自己是某个特定模型（例如 Claude 3.5 Sonnet、GPT-4 等）。",
             f"当用户询问“你是什么模型/用的什么模型”时：只允许报告当前配置的模型名称：{model_name}；同时说明这只是运行时配置名，并不等于你能确认底层供应商或版本。",
             "严禁虚构已执行的动作：除非工具确实返回了可验证的结果，否则不要声称“已创建/已运行/已完成”。",
@@ -289,9 +249,7 @@ def build_single_agent(
             "当命令可能长时间运行或可能卡住时：优先使用 Exec 工具并启用 background/yield_ms，以便随时用 process kill 退出；不要让对话长期阻塞在单次命令上。",
             "当需要长期一致性时：先读取 core 记忆（memory_core_read: identity/traits），再做关键决策。",
             "当用户要求设定/修改你的身份、边界、原则、表达风格时，把稳定信息写入 core 记忆（memory_core_append/memory_core_write）。",
-            "你可以使用 remember/recall/forget 管理长期记忆（按 user_id 跨线程共享）；shared_context_put/shared_context_get/shared_context_forget 管理线程内共享上下文。",
-            "长期记忆分工与权威源：core 记忆 Markdown（soul/traits/identity/user）只存放身份、原则、表达偏好、长期目标、边界；LangGraph Store（remember/recall）只存放可枚举的稳定事实（姓名、生日、角色关系、账号、设备信息等）。",
-            "避免重叠：不要把“事实型字段值”写入 core 记忆；不要把“身份/原则/边界/表达风格”写入 LangGraph Store。若同一事实出现多版本，以 LangGraph Store 为准并更新它。",
+            "长期记忆分工与权威源：core 记忆 Markdown（soul/traits/identity/user）只存放身份、原则、表达偏好、长期目标、边界；会话记忆（episodic/rollups）用于回顾过去对话与任务进展。",
             "当用户询问你在过去某天/某段时间做了什么、某项目进展、之前的结论/决定时：优先用 memory_session_query（或 memory_session_search）检索会话记忆，再基于检索结果回答。",
             "当收到以 [REMINDER id=...] 或 [SYSTEM_TASK id=...] 开头的消息时：把它当作系统事件处理，直接执行或输出可执行步骤；不要寒暄；不要使用表情符号；不要编造“仍在倒计时/仍在运行”等状态。",
             f"默认通过 write_file 工具生成的文件写入输出工作空间目录：{output_dir.as_posix()}",
@@ -311,6 +269,5 @@ def build_single_agent(
         system_prompt=system_prompt,
         middleware=[skill_middleware, memory_middleware],
         state_schema=UnifiedAgentState,
-        store=store,
         checkpointer=checkpointer,
     )

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 import os
-import threading
 import time
 import uuid
 from pathlib import Path
@@ -228,23 +227,6 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
                     parts.append(text)
         return "".join(parts)
     return str(content)
-
-
-class _LockedProxy:
-    def __init__(self, obj: object) -> None:
-        self._obj = obj
-        self._lock = threading.RLock()
-
-    def __getattr__(self, name: str):
-        attr = getattr(self._obj, name)
-        if not callable(attr):
-            return attr
-
-        def _wrapped(*args, **kwargs):
-            with self._lock:
-                return attr(*args, **kwargs)
-
-        return _wrapped
 
 
 def _summarize_tool_output_for_terminal(raw: str) -> str:
@@ -650,15 +632,7 @@ def build_agent(
 
     from langgraph.checkpoint.memory import InMemorySaver
 
-    from memory.paths import langgraph_store_path
-    from memory.storage import PersistentInMemoryStore
-
-    langgraph_path = langgraph_store_path(project_root)
-    langgraph_path.parent.mkdir(parents=True, exist_ok=True)
-    store = PersistentInMemoryStore(path=langgraph_path)
     checkpointer = InMemorySaver()
-
-    store = _LockedProxy(store)
 
     from .agent import build_single_agent
 
@@ -671,7 +645,6 @@ def build_agent(
         skill_middleware=skill_middleware,
         memory_middleware=memory_middleware,
         mcp_tools=mcp_tools,
-        store=store,
         checkpointer=checkpointer,
     )
 

@@ -1562,6 +1562,171 @@ def memory_user_write(content: str) -> str:
         return f"Write failed: {e}"
 
 
+@tool
+def identity_auth(username: str, password: str, ttl_s: int = 1800, runtime: ToolRuntime = None) -> str:
+    """Authenticate the current thread with a time-limited identity state."""
+    tid = _runtime_thread_id(runtime) if runtime is not None else (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
+    u = (username or "").strip()
+    pw = password or ""
+    if not u or not pw:
+        return json.dumps({"ok": False, "error": "empty_username_or_password"}, ensure_ascii=False, sort_keys=True)
+    try:
+        from memory.manager import verify_thread_auth, set_thread_identity
+    except Exception as e:
+        return f"Import failed: {e}"
+    ok, state = verify_thread_auth(tid, user=u, password=pw, ttl_s=ttl_s, extend=True)
+    set_thread_identity(tid, confirmed=bool(ok))
+    out = {"ok": bool(ok), "thread_id": tid}
+    out.update(state if isinstance(state, dict) else {})
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def identity_auth_status(runtime: ToolRuntime = None) -> str:
+    """Get time-limited identity state for the current thread."""
+    tid = _runtime_thread_id(runtime) if runtime is not None else (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
+    try:
+        from memory.manager import get_thread_auth
+    except Exception as e:
+        return f"Import failed: {e}"
+    state = get_thread_auth(tid, purge_expired=True)
+    if not state:
+        return json.dumps({"ok": True, "thread_id": tid, "auth_valid": False}, ensure_ascii=False, sort_keys=True)
+    out = {"ok": True, "thread_id": tid}
+    out.update(state)
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def identity_auth_clear(runtime: ToolRuntime = None) -> str:
+    """Clear time-limited identity state for the current thread."""
+    tid = _runtime_thread_id(runtime) if runtime is not None else (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
+    try:
+        from memory.manager import clear_thread_auth, set_thread_identity
+    except Exception as e:
+        return f"Import failed: {e}"
+    clear_thread_auth(tid)
+    set_thread_identity(tid, confirmed=False)
+    return json.dumps({"ok": True, "thread_id": tid}, ensure_ascii=False, sort_keys=True)
+
+
+_IDENTITY_MEMORY_BLOCK_START = "<IDENTITY_AUTH>"
+_IDENTITY_MEMORY_BLOCK_END = "</IDENTITY_AUTH>"
+
+
+def _identity_memory_parse(text: str) -> dict[str, str]:
+    if not text:
+        return {}
+    start = text.find(_IDENTITY_MEMORY_BLOCK_START)
+    if start < 0:
+        return {}
+    end = text.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
+    if end < 0:
+        return {}
+    body = text[start + len(_IDENTITY_MEMORY_BLOCK_START) : end]
+    out: dict[str, str] = {}
+    for raw_line in (body or "").splitlines():
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        k, sep, v = line.partition(":")
+        if not sep:
+            continue
+        key = (k or "").strip()
+        val = (v or "").strip()
+        if key:
+            out[key] = val
+    return out
+
+
+def _identity_memory_render(*, username: str, password: str, name: str, role: str, relation: str) -> str:
+    now = datetime.now().astimezone().isoformat(sep=" ", timespec="seconds")
+    lines = [
+        _IDENTITY_MEMORY_BLOCK_START,
+        f"username: {(username or '').strip()}",
+        f"password: {password or ''}",
+        f"name: {(name or '').strip()}",
+        f"role: {(role or '').strip()}",
+        f"relation: {(relation or '').strip()}",
+        f"updated_at: {now}",
+        _IDENTITY_MEMORY_BLOCK_END,
+    ]
+    return "\n".join(lines).strip()
+
+
+def _identity_memory_upsert(existing: str, block: str) -> str:
+    text = existing or ""
+    start = text.find(_IDENTITY_MEMORY_BLOCK_START)
+    if start >= 0:
+        end = text.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
+        if end >= 0:
+            end2 = end + len(_IDENTITY_MEMORY_BLOCK_END)
+            before = text[:start].rstrip()
+            after = text[end2:].lstrip()
+            parts = []
+            if before:
+                parts.append(before)
+            parts.append(block)
+            if after:
+                parts.append(after)
+            return "\n\n".join(parts).strip() + "\n"
+    if text.strip():
+        return text.rstrip() + "\n\n" + block + "\n"
+    return block + "\n"
+
+
+@tool
+def identity_memory_set(
+    username: str,
+    password: str,
+    name: str = "",
+    role: str = "",
+    relation: str = "",
+) -> str:
+    """Persist identity credentials into user memory markdown (plain text)."""
+    u = (username or "").strip()
+    pw = password or ""
+    if not u or not pw:
+        return json.dumps({"ok": False, "error": "empty_username_or_password"}, ensure_ascii=False, sort_keys=True)
+    try:
+        from memory.paths import user_path
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = user_path(_memory_project_root())
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
+        block = _identity_memory_render(username=u, password=pw, name=name, role=role, relation=relation)
+        new_text = _identity_memory_upsert(existing, block)
+        p.write_text(new_text, encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"Write failed: {e}"
+    return json.dumps({"ok": True, "username": u}, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def identity_memory_get() -> str:
+    """Read identity credentials from user memory markdown."""
+    try:
+        from memory.paths import user_path
+    except Exception as e:
+        return f"Import failed: {e}"
+    p = user_path(_memory_project_root())
+    if not p.exists() or not p.is_file():
+        return json.dumps({"ok": True, "found": False}, ensure_ascii=False, sort_keys=True)
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError as e:
+        return f"Read failed: {e}"
+    data = _identity_memory_parse(text)
+    if not data:
+        return json.dumps({"ok": True, "found": False}, ensure_ascii=False, sort_keys=True)
+    out: dict[str, object] = {"ok": True, "found": True}
+    out.update(data)
+    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+
+
 def _session_memory_md_path(project_root: Path, date_str: str) -> tuple[Path | None, str | None]:
     raw = (date_str or "").strip()
     if not raw or raw.lower() in {"today", "now"}:

@@ -137,7 +137,6 @@ def main() -> None:
     (project_root / ".agents").mkdir(parents=True, exist_ok=True)
 
     os.environ.setdefault("AGENT_MEMORY_DIR", str((project_root / "memory").resolve()))
-    os.environ.setdefault("AGENT_LANGGRAPH_STORE_PATH", str((project_root / "memory" / "langgraph_store.json").resolve()))
 
     ensure_memory_scaffold(project_root)
     try:

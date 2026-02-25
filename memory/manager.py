@@ -16,16 +16,169 @@ from . import paths
 from .model import init_model
 
 
+_THREAD_IDENTITY_LOCK = threading.RLock()
+_THREAD_IDENTITY: dict[str, dict[str, str]] = {}
+
+_THREAD_AUTH_LOCK = threading.RLock()
+_THREAD_AUTH: dict[str, dict[str, object]] = {}
+
+
+def _auth_ttl_s_default() -> int:
+    raw = (os.environ.get("AGENT_AUTH_TTL_S") or "").strip()
+    if not raw:
+        return 1800
+    try:
+        v = int(raw)
+    except ValueError:
+        return 1800
+    return max(60, min(86400, v))
+
+
+def set_thread_auth(
+    thread_id: str,
+    *,
+    user: str,
+    password: str,
+    ttl_s: int | None = None,
+) -> dict[str, object]:
+    tid = (thread_id or "").strip() or "default"
+    u = (user or "").strip()
+    pw = password or ""
+    ttl = int(ttl_s) if ttl_s is not None else _auth_ttl_s_default()
+    ttl = max(60, min(86400, ttl))
+    now_ts = datetime.now().astimezone().timestamp()
+    exp_ts = now_ts + float(ttl)
+    data: dict[str, object] = {
+        "user": u,
+        "password": pw,
+        "issued_at_ts": now_ts,
+        "expires_at_ts": exp_ts,
+        "ttl_s": ttl,
+    }
+    with _THREAD_AUTH_LOCK:
+        _THREAD_AUTH[tid] = dict(data)
+    return get_thread_auth(tid, purge_expired=False)
+
+
+def clear_thread_auth(thread_id: str) -> None:
+    tid = (thread_id or "").strip() or "default"
+    with _THREAD_AUTH_LOCK:
+        _THREAD_AUTH.pop(tid, None)
+
+
+def get_thread_auth(thread_id: str, *, purge_expired: bool = True) -> dict[str, object]:
+    tid = (thread_id or "").strip() or "default"
+    with _THREAD_AUTH_LOCK:
+        raw = dict(_THREAD_AUTH.get(tid) or {})
+    if not raw:
+        return {}
+    now_ts = datetime.now().astimezone().timestamp()
+    exp_ts = float(raw.get("expires_at_ts") or 0.0)
+    ok = exp_ts > now_ts
+    if not ok and purge_expired:
+        with _THREAD_AUTH_LOCK:
+            cur = _THREAD_AUTH.get(tid)
+            if isinstance(cur, dict) and float(cur.get("expires_at_ts") or 0.0) <= now_ts:
+                _THREAD_AUTH.pop(tid, None)
+        return {}
+
+    out: dict[str, object] = {
+        "auth_valid": bool(ok),
+        "user": (raw.get("user") or ""),
+        "password": (raw.get("password") or ""),
+        "ttl_s": int(raw.get("ttl_s") or 0),
+    }
+    if exp_ts:
+        out["expires_at"] = datetime.fromtimestamp(exp_ts).astimezone().isoformat(sep=" ", timespec="seconds")
+        out["remaining_s"] = max(0, int(exp_ts - now_ts))
+    issued_ts = float(raw.get("issued_at_ts") or 0.0)
+    if issued_ts:
+        out["issued_at"] = datetime.fromtimestamp(issued_ts).astimezone().isoformat(sep=" ", timespec="seconds")
+    return out
+
+
+def is_thread_auth_valid(thread_id: str) -> bool:
+    data = get_thread_auth(thread_id, purge_expired=True)
+    return bool(data.get("auth_valid"))
+
+
+def verify_thread_auth(
+    thread_id: str,
+    *,
+    user: str,
+    password: str,
+    ttl_s: int | None = None,
+    extend: bool = True,
+) -> tuple[bool, dict[str, object]]:
+    tid = (thread_id or "").strip() or "default"
+    u = (user or "").strip()
+    pw = password or ""
+    if not u or not pw:
+        return False, {}
+
+    now_ts = datetime.now().astimezone().timestamp()
+    with _THREAD_AUTH_LOCK:
+        cur = dict(_THREAD_AUTH.get(tid) or {})
+
+    if cur:
+        exp_ts = float(cur.get("expires_at_ts") or 0.0)
+        if exp_ts > now_ts:
+            ok = (cur.get("user") or "") == u and (cur.get("password") or "") == pw
+            if not ok:
+                return False, get_thread_auth(tid, purge_expired=False)
+            if extend:
+                ttl = int(ttl_s) if ttl_s is not None else int(cur.get("ttl_s") or _auth_ttl_s_default())
+                ttl = max(60, min(86400, ttl))
+                cur["ttl_s"] = ttl
+                cur["expires_at_ts"] = now_ts + float(ttl)
+                cur["password"] = pw
+                with _THREAD_AUTH_LOCK:
+                    _THREAD_AUTH[tid] = dict(cur)
+            return True, get_thread_auth(tid, purge_expired=False)
+
+    data = set_thread_auth(tid, user=u, password=pw, ttl_s=ttl_s)
+    return True, data
+
+
+def set_thread_identity(
+    thread_id: str,
+    *,
+    confirmed: str | bool = "true",
+    role: str = "",
+    name: str = "",
+    relation: str = "",
+) -> None:
+    tid = (thread_id or "").strip() or "default"
+    if isinstance(confirmed, bool):
+        ok = confirmed
+    else:
+        ok = (confirmed or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    with _THREAD_IDENTITY_LOCK:
+        data = dict(_THREAD_IDENTITY.get(tid) or {})
+        data["confirmed"] = "true" if ok else ""
+        if role:
+            data["role"] = role
+        if name:
+            data["name"] = name
+        if relation:
+            data["relation"] = relation
+        _THREAD_IDENTITY[tid] = data
+
+
+def get_thread_identity(thread_id: str) -> dict[str, str]:
+    tid = (thread_id or "").strip() or "default"
+    with _THREAD_IDENTITY_LOCK:
+        return dict(_THREAD_IDENTITY.get(tid) or {})
+
+
 def ensure_memory_scaffold(project_root: Path) -> dict[str, str]:
     root = paths.memory_root(project_root)
     core = paths.core_dir(project_root)
-    kg_dir = paths.langgraph_store_path(project_root).parent
     extracted_dir = paths.episodic_dir(project_root)
     rollups_dir = paths.rollups_root(project_root)
 
     root.mkdir(parents=True, exist_ok=True)
     core.mkdir(parents=True, exist_ok=True)
-    kg_dir.mkdir(parents=True, exist_ok=True)
     extracted_dir.mkdir(parents=True, exist_ok=True)
     try:
         paths.rollup_dir(project_root, "daily").mkdir(parents=True, exist_ok=True)
@@ -196,49 +349,6 @@ def _extract_auth_snippets(core_text: str) -> str:
     return "\n".join(out).strip()
 
 
-def _attempt_passphrase_auth(*, core_text: str, user_text: str, runtime, tid: str) -> bool:
-    if not core_text or not user_text:
-        return False
-    store_obj = getattr(runtime, "store", None)
-    if store_obj is None:
-        return False
-    for raw_line in (core_text or "").splitlines():
-        s = (raw_line or "").strip()
-        if not s:
-            continue
-        m = _AUTH_INLINE_RX.search(s)
-        if not m:
-            continue
-        code = (m.group(1) or "").strip()
-        if not code:
-            continue
-        if code not in user_text:
-            continue
-        meta = (m.group(2) or "").strip() if m.lastindex and m.lastindex >= 2 else ""
-        role = "超级管理员" if ("主用户" in meta or "超级管理员" in meta) else ("普通用户" if "普通用户" in meta else "超级管理员")
-        name = ""
-        relation = ""
-        if meta:
-            m2 = re.search(r"(?:name|姓名)\s*(?:[:：=])\s*([^；;，,]+)", meta, flags=re.I)
-            if m2:
-                name = (m2.group(1) or "").strip()
-            m3 = re.search(r"(?:relation|关系)\s*(?:[:：=])\s*([^；;，,]+)", meta, flags=re.I)
-            if m3:
-                relation = (m3.group(1) or "").strip()
-        try:
-            store_obj.put(("shared", tid), "identity_confirmed", {"value": "true"})
-            if role:
-                store_obj.put(("shared", tid), "identity_role", {"value": role})
-            if name:
-                store_obj.put(("shared", tid), "identity_name", {"value": name})
-            if relation:
-                store_obj.put(("shared", tid), "identity_relation", {"value": relation})
-        except Exception:
-            return False
-        return True
-    return False
-
-
 class CoreMemoryMiddleware(AgentMiddleware):
 
 
@@ -261,31 +371,20 @@ class CoreMemoryMiddleware(AgentMiddleware):
         bootstrap = (os.environ.get("AGENT_USER_BOOTSTRAP") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
         identity_confirmed = False
         runtime = getattr(request, "runtime", None)
+        tid = "default"
         if runtime is not None:
             cfg = getattr(runtime, "config", None) or {}
-            tid = ""
             if isinstance(cfg, dict):
                 configurable = cfg.get("configurable") or {}
                 if isinstance(configurable, dict):
                     tid = (configurable.get("thread_id") or "").strip()
             tid = tid or "default"
 
-            store_obj = getattr(runtime, "store", None)
-            if store_obj is not None:
-                try:
-                    item = store_obj.get(("shared", tid), "identity_confirmed")
-                except Exception:
-                    item = None
-                if item is not None:
-                    val = getattr(item, "value", None)
-                    if isinstance(val, dict):
-                        v = val.get("value")
-                        if isinstance(v, str) and v.strip().lower() in {"1", "true", "yes", "y", "on"}:
-                            identity_confirmed = True
-                if not identity_confirmed:
-                    user_text = _extract_last_user_text(request)
-                    if _attempt_passphrase_auth(core_text=core_text, user_text=user_text, runtime=runtime, tid=tid):
-                        identity_confirmed = True
+        data = get_thread_identity(tid)
+        identity_confirmed = bool((data.get("confirmed") or "").strip())
+        if identity_confirmed and not is_thread_auth_valid(tid):
+            set_thread_identity(tid, confirmed=False)
+            identity_confirmed = False
 
         now_dt = datetime.now().astimezone()
         weekday = "一二三四五六日"[now_dt.isoweekday() - 1]
@@ -316,11 +415,13 @@ class CoreMemoryMiddleware(AgentMiddleware):
             "你需要在对话中识别当前正在与你交流的“用户”，并把稳定信息写入 core/user.md。",
             "识别方式仅使用对方在本次对话中自报的姓名/称呼与其与主用户的关系描述（不要做代码级硬识别）。",
             "不要基于 core/user.md 已存在的记录，直接推断“当前对话对象”就是其中的某个人；core/user.md 只能作为核对与长期记录的载体，不是本轮身份确认的证据。",
-            "若用户在本次对话中提供“专属口令/口令”，且与 core 记忆中的某条口令配置匹配：你可以直接确认身份（不要复述口令），并写入 identity_confirmed=true 以及 identity_name/identity_role/identity_relation（如可得）。",
+            "若用户在本次对话中提供“专属口令/口令”，且与 core 记忆中的某条口令配置匹配：你可以直接确认身份（不要复述口令），并建立本线程的时效身份态。",
             "当用户输入不足以确认身份（例如：在吗/你好/帮我一下/继续）时：默认使用中性称呼（你/您好），并先询问“你希望我怎么称呼你？”以及“你与主用户是什么关系？”。",
-            "当身份确认完成时：调用 shared_context_put 写入 identity_confirmed=true，并写入 identity_name/identity_role/identity_relation 以便后续回合稳定执行权限策略与表达风格。",
+            "当用户同意进行身份验证时：调用 identity_auth(username,password,ttl_s) 建立/续期本线程的身份态；用 identity_auth_status 检查是否仍有效。",
+            "可用 identity_memory_set 与 identity_memory_get 读写 user.md 中的用户名与口令（明文）。",
+            "当身份信息明确时：调用 memory_identity_set 写入 identity_name/identity_role/identity_relation；身份放行以 identity_auth_status 的 auth_valid=true 为准。",
             "更新 user.md 时：保持 Markdown 结构，小改动写入；重复的合并；不要覆盖主用户已确认的信息。",
-            "不要把口令、密钥、一次性验证码等敏感信息写入 user.md。",
+            "允许把用户名与口令写入 user.md（明文）与工具身份态中，用于后续同一用户校验。",
         ]
         if bootstrap:
             policy_lines = [

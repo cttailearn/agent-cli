@@ -76,13 +76,6 @@ def core_file_by_kind(project_root: Path, kind: str) -> Path | None:
     return None
 
 
-def langgraph_store_path(project_root: Path) -> Path:
-    raw = (os.environ.get("AGENT_LANGGRAPH_STORE_PATH") or "").strip()
-    if raw:
-        return _resolve_path(project_root, raw)
-    return (memory_root(project_root) / "langgraph_store.json").resolve()
-
-
 def rollups_root(project_root: Path) -> Path:
     raw = (os.environ.get("AGENT_MEMORY_ROLLUPS_DIR") or "").strip()
     if raw:
