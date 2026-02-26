@@ -1,421 +1,320 @@
-# Agent-CLI 项目
+# Agent-CLI
 
-## 1. 项目概述
+Agent-CLI 是一个“单智能体 + 工具调用”的本地运行时：既可以在终端交互，也可以通过 WebSocket API 提供给 Web/Android 客户端。它围绕三个核心能力构建：
 
-**agent-cli** 是一个基于 LangChain 的单智能体命令行工具，支持技能管理、记忆系统、工具调用与系统任务调度。智能体在同一条执行链路上完成“理解 → 规划 → 执行”。
+- 可控执行：读写文件、查找/替换、运行命令等全部通过工具完成，并带路径与命令安全限制。
+- 技能系统：从 `SKILL.md` 自动发现技能目录，按需加载技能正文（progressive disclosure）。
+- 记忆系统：Core Memories（Markdown）+ 会话记忆（Episodic）+ 自动 rollup（日/周/月/年）+ LangGraph Store（remember/recall）。
 
-**核心目标**：提供一个可扩展的、具有长期记忆和技能管理能力的智能体框架，支持本地文件操作、命令行执行、知识图谱构建等。
+## 快速开始（CLI）
 
-**项目状态**：代码结构清晰，模块化程度高，处于活跃开发阶段。
+### 运行环境
 
-## 1.1 配置文件（agent.json）
+- Python >= 3.12（见 [pyproject.toml](pyproject.toml)）
+- 推荐使用 uv 管理依赖（仓库包含 [uv.lock](uv.lock)）
+- 如果要使用“技能生态安装/查找”：需要 Node.js（用于 `npx skills`）
 
-项目入口使用 **JSON 配置文件** 作为唯一配置来源：默认读取仓库根目录下的 [agent.json](file:///d:/tools/agent-cli/agent.json)。
+### 安装依赖（uv）
 
-- 配置文件路径：可通过环境变量 `AGENT_CONFIG_PATH` 指定（例如 `AGENT_CONFIG_PATH=D:\\tools\\agent-cli\\agent.json`）
-- 交互模式下支持热更新：修改 `agent.json` 后无需重启，下一轮输入前会自动检测并重载
-- 密钥不要写入仓库文件：推荐在 `agent.json` 中使用 `${OPENAI_API_KEY}` / `${DEEPSEEK_API_KEY}` 引用系统环境变量
+```bash
+uv sync
+```
 
-### 1.1.1 基础路径配置（main.py）
+### 配置密钥
 
-- `AGENT_PROJECT_DIR`：智能体根目录（工作区根）；为空时默认 `main.py` 同级目录下的 `workspace/`（启动时自动创建，见 [main.py](file:///d:/tools/agent-cli/main.py#L59-L64)）。
-- `AGENT_OUTPUT_DIR`：输出**基目录**；默认 `out`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L67-L72)）。
-- `output.workspace` / `AGENT_OUTPUT_WORKSPACE`：输出工作空间名；最终输出目录为 `{AGENT_OUTPUT_DIR}/{workspace}/`（可在交互中用 `/ws <name>` 切换）。
-- `AGENT_WORK_DIR`：命令执行工作目录；默认等同智能体根目录（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L74-L81)）。
-- `AGENT_SKILLS_DIR`：项目技能目录；默认 `skills`（相对智能体根目录；见 [main.py](file:///d:/tools/agent-cli/main.py#L21-L25)）。
-- `AGENT_SKILLS_DIRS`：技能目录列表（`;` 或 `,` 分隔）；相对路径均按智能体根目录解析；不填则只使用 `AGENT_SKILLS_DIR`（并自动追加内置技能目录与全局技能目录，见 [main.py](file:///d:/tools/agent-cli/main.py#L106-L124)）。
+默认使用仓库根目录 [agent.json](agent.json) 作为唯一配置来源（也可用 `AGENT_CONFIG_PATH` 指定其他路径）。建议把密钥放到系统环境变量或 `.env`，然后在 `agent.json` 用 `${ENV_VAR}` 引用。
 
-### 1.1.2 模型配置（agent.json）
+示例（Windows PowerShell）：
 
-模型由 `agent.json` 的 `models` + `active_model` 管理，并提供交互命令热切换：
+```powershell
+$env:DEEPSEEK_API_KEY="sk-..."
+```
 
-- `/models list`：列出模型列表与当前激活项
-- `/models <name>`：切换到指定模型（会写回 `agent.json` 并自动重建运行时，无需重启）
+或在当前目录创建 `.env`（不会自动提交仓库）：
 
-模型写法示例：
+```dotenv
+DEEPSEEK_API_KEY=sk-...
+OPENAI_API_KEY=...
+OPENAI_BASE_URL=https://api.openai.com/v1
+```
 
-- DeepSeek：`"model": "deepseek:deepseek-chat"`，并在该模型的 `env` 中提供 `DEEPSEEK_API_KEY`
-- OpenAI/兼容 OpenAI：`"model": "openai:gpt-4o-mini"`，并在该模型的 `env` 中提供 `OPENAI_API_KEY`；如需第三方兼容服务，额外提供 `OPENAI_BASE_URL`
+### 启动交互式 CLI
 
-### 1.1.3 MCP 配置
+```bash
+python run_cli.py
+```
 
-- `AGENT_MCP_CONFIG`：MCP 配置文件路径（相对智能体根目录或绝对路径；为空则不加载 MCP 工具，见 [load_mcp_tools_from_config](file:///d:/tools/agent-cli/agents/tools.py#L1186-L1199) 与 [main.py](file:///d:/tools/agent-cli/main.py#L83-L87)）。
+首次启动时，如果 `workspace/memory/user.md` 为空，系统会进入“主用户引导（bootstrap）”，提示你补全称呼等信息并写入长期记忆。
 
-### 1.1.4 记忆系统路径（memory/paths.py）
+### 单次执行模式
 
-以下配置支持相对路径（相对 `AGENT_PROJECT_DIR`）或绝对路径（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L7-L12)）：
+```bash
+python run_cli.py "帮我总结一下这个仓库有哪些入口文件，以及它们的用途"
+```
 
-- `AGENT_MEMORY_DIR`：记忆根目录；默认 `memory`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L24-L29)）。
-- `AGENT_MEMORY_CORE_DIR`：core 记忆目录；默认等同 `AGENT_MEMORY_DIR`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L31-L35)）。
-- `AGENT_MEMORY_CHATS_DIR`：聊天记录目录；默认 `{AGENT_MEMORY_DIR}/chats`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L38-L43)）。
-- `AGENT_MEMORY_KG_DIR`：知识图谱目录；默认 `{AGENT_MEMORY_DIR}/kg`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L45-L49)）。
-- `AGENT_MEMORY_GRAPH_PATH`：知识图谱文件路径；默认 `{AGENT_MEMORY_KG_DIR}/graph.json`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L52-L56)）。
-- `AGENT_MEMORY_SOUL_PATH` / `AGENT_MEMORY_TRAITS_PATH` / `AGENT_MEMORY_IDENTITY_PATH` / `AGENT_MEMORY_USER_PATH`：core 记忆文件路径（默认位于 core 目录，见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L59-L84)）。
-- `AGENT_LANGGRAPH_STORE_PATH`：LangGraph 长期记忆 Store 的持久化路径；默认 `{AGENT_MEMORY_DIR}/langgraph_store.json`（见 [paths.py](file:///d:/tools/agent-cli/memory/paths.py#L107-L111)）。
+### CLI 参数
 
-### 1.1.5 运行时控制（递归深度）
+见 [run_cli.py](run_cli.py) 的 argparse 定义：
 
-- `AGENT_RECURSION_LIMIT`：LangGraph 的 recursion_limit（默认 64，范围 10~500，见 [runtime.py](file:///g:/AI/agent-cli/agents/runtime.py#L190-L198) 与 [terminal_display.py](file:///g:/AI/agent-cli/terminal_display.py#L242-L259)）。
+```bash
+python run_cli.py --help
+```
 
-## 2. 项目结构
+常用参数：
+
+- `--project-dir`：运行时 project_dir（默认 `./workspace`）
+- `--output-dir`：输出基目录（默认 `out`，位于 project_dir 下）
+- `--output-workspace`：输出工作空间名（默认 `default`）
+- `--work-dir`：命令执行工作目录（默认 project_dir）
+- `--skills-dir` / `--skills-dirs`：技能目录与技能目录列表（均限制在 project_dir 内）
+- `--mcp-config`：MCP 配置路径（默认 `mcp/config.json`，位于 project_dir 下）
+- `--model`：模型名（最终会写入 `LC_MODEL`）
+
+## 配置说明（agent.json）
+
+### 配置加载与热更新
+
+- 默认配置路径：仓库根目录 `agent.json`
+- 覆盖路径：`AGENT_CONFIG_PATH=/abs/path/to/agent.json`
+- CLI 交互模式会在每轮输入前检测配置文件 mtime/size，变更后自动应用并重建运行时（见 [run_cli.py](run_cli.py)）
+
+配置展开规则：
+
+- `env` / `models.<key>.env` 中支持 `${ENV_VAR}` 引用环境变量（见 [config_manager.py](config_manager.py)）
+
+### 关键字段
+
+#### 1) `env`（全局环境变量）
+
+`env` 里的相对路径，均按 `AGENT_PROJECT_DIR` 解析（运行时会把它解析为绝对路径）。
+
+常用项（默认值见 [agent.json](agent.json)）：
+
+- `AGENT_PROJECT_DIR`：运行时“项目根目录”（默认 `workspace/`）
+- `AGENT_SKILLS_DIR`：项目技能目录（默认 `skills/`，位于 project_dir 下）
+- `AGENT_SKILLS_DIRS`：额外技能目录列表（`;` 或 `,` 分隔，均要求在 project_dir 下）
+- `AGENT_MCP_CONFIG`：MCP 配置路径（默认 `mcp/config.json`，位于 project_dir 下）
+- `AGENT_MEMORY_DIR`：记忆根目录（默认 `memory/`，位于 project_dir 下）
+- `AGENT_OUTPUT_DIR`：输出基目录（默认 `out/`，位于 project_dir 下）
+- `AGENT_SESSION_MEMORY_INPUT_TOKENS_THRESHOLD`：输入 token 超阈值时自动轮转线程并携带上一轮摘要（默认 `200000`）
+
+运行时还会补充（便于工具层读取）：
+
+- `AGENT_OUTPUT_BASE_DIR`：输出基目录的绝对路径
+- `AGENT_OUTPUT_WORKSPACE`：输出工作空间名（来自 `output.workspace` 或 `/ws` 切换）
+- `AGENT_OUTPUT_DIR`：实际输出目录（= `AGENT_OUTPUT_BASE_DIR/AGENT_OUTPUT_WORKSPACE`）
+- `AGENT_WORK_DIR`：命令执行工作目录（默认 project_dir，可用 `/cd` 或启动参数修改）
+- `AGENT_USER_BOOTSTRAP`：是否处于主用户引导阶段（0/1）
+
+#### 2) `models` + `active_model`（模型选择）
+
+- `active_model` 指向 `models` 里的某个 key
+- 每个模型可单独配置 `env`
+
+CLI 内置：
+
+- `/models list`：列出模型
+- `/models <name>`：切换模型（会写回 `agent.json` 并重建运行时）
+
+#### 3) `output.workspace`（输出工作空间）
+
+- 可用 `/ws list` 查看已有工作空间目录
+- 可用 `/ws <name>` 切换输出工作空间（会写回 `agent.json` 并重建运行时）
+
+最终输出目录：`<project_dir>/<out>/<workspace>/`
+
+#### 4) `permissions`（白名单 + 沙箱）
+
+该段会被转换为运行时环境变量（见 [config_manager.py](config_manager.py)）：
+
+- `write_extra_roots` → `AGENT_EXTRA_WRITE_ROOTS`：允许 `write_file` 写入的额外绝对根目录
+- `cli_extra_roots` → `AGENT_EXTRA_CWD_ROOTS`：允许 `run_cli` / Exec 的额外 cwd 根目录
+- `sandbox` → `AGENT_SANDBOX`：`on/off`（on 时会阻断危险命令/脚本与越界路径）
+
+## 运行时结构（repo root vs project_dir）
+
+仓库根目录是“代码与配置”，运行时会在 `AGENT_PROJECT_DIR`（默认 `workspace/`）下生成工作数据：
 
 ```
 agent-cli/
-├── main.py                      # 主入口，CLI 参数解析与初始化
-├── agents/                      # 智能体实现
-│   ├── single_agent.py          # 单智能体（对话 + 执行）
-│   ├── runtime.py               # 智能体构建与运行时支持
-│   └── __init__.py
-├── memory/                      # 记忆系统
-│   ├── manager.py               # 记忆管理器
-│   ├── worker.py                # 知识图谱工作线程
-│   ├── storage.py               # 存储抽象（聊天记录、知识图谱）
-│   ├── query.py                 # 知识图谱查询
-│   ├── paths.py                 # 记忆路径管理
-│   ├── model.py                 # 模型初始化
-│   └── __init__.py
-├── skills/                      # 技能目录（用户自定义）
-│   ├── skills_manager.py            # 技能管理器（安装、发现、状态）
-│   ├── skills_support.py            # 技能发现、中间件、目录构建
-│   ├── skills_state.py              # 技能状态持久化
-├── tools.py                     # 核心工具集（文件读写、命令执行等）
-├── terminal_display.py          # 终端显示与交互
-├── sysinfo.py                   # 系统信息收集
-├── mcp/                         # MCP 配置示例（可选；默认从 workspace/mcp/ 读取）
-├── pyproject.toml               # 项目配置
-├── README.md                    # 项目说明
-└── workspace/                   # 工作区（运行时生成）
-    ├── .agents/                 # 运行时状态（技能状态等）
-    ├── mcp/                     # MCP 配置（默认读取 workspace/mcp/config.json）
-    ├── memory/                  # 记忆存储
-    ├── out/                     # 输出基目录（实际输出在 out/<workspace>/ 下）
-    └── skills/                  # 项目技能目录（默认读取 workspace/skills/）
+├── agent.json
+├── run_cli.py
+├── run_api.py
+├── agents/                 # 智能体（工具与运行时）
+├── memory/                 # 记忆实现（core/episodic/rollups）
+├── skills/                 # 技能系统（discover/enable/disable/install）
+├── system/                 # 系统任务/调度/终端显示
+├── api/                    # FastAPI + WebSocket 服务端
+├── ui/                     # 纯静态 WebSocket Chat（打开 index.html 即可用）
+├── android/                # Android 客户端示例
+└── workspace/              # 默认 project_dir（运行时生成/持久化）
+    ├── .agents/            # 内部状态（skills_state、npx cache、临时目录等）
+    ├── skills/             # 项目技能目录（SKILL.md）
+    ├── memory/             # 记忆数据（core/episodic/rollups/store）
+    ├── schedules/          # reminders.json（提醒/调度）
+    └── out/                # 输出基目录（实际输出在 out/<workspace>/ 下）
 ```
 
-### 模块依赖关系
-
-- `main.py` → `agents.runtime`、`memory.manager`、`terminal_display`
-- `agents.runtime` → `single_agent`、`skills_support`、`tools`
-- 记忆系统独立，通过 `MemoryManager` 统一管理
-- 技能系统通过 `SkillMiddleware` 注入到智能体
-
-## 3. 模块详细分析
-
-### 3.1 主入口 (main.py)
-
-- 负责命令行参数解析，环境变量加载，目录初始化
-- 创建 `MemoryManager` 启动知识图谱工作线程
-- 调用 `build_agent` 构建单智能体
-- 支持单次执行和交互模式
-- 代码清晰，错误处理较为完善
-
-### 3.2 智能体模块 (agents/)
-
-#### 3.2.1 单智能体 (single_agent.py)
-
-- **职责**：与用户对话、理解意图、规划步骤，并在需要时直接执行（读写文件、运行命令、调用外部工具）
-- **工具集**：文件/命令/MCP/技能管理/记忆检索与写入等统一在一个工具集合中
-- **会话与共享上下文**：提供轻量的会话级记忆与跨回合共享上下文读写工具
-- **设计特点**：减少额外模型往返，执行链路更短，便于调试与部署
-
-#### 3.2.2 运行时 (runtime.py)
-
-- **核心函数**：`build_agent` 负责构建单智能体并注入中间件与 Store/Checkpointer
-- **模型初始化**：支持 DeepSeek 模型和通用 LangChain 模型
-- **工具格式化**：`_format_tools` 提供统一的工具描述输出
-- **递归限制**：通过环境变量 `AGENT_RECURSION_LIMIT` 控制工具调用深度
-
-### 3.3 记忆系统 (memory/)
-
-#### 3.3.1 记忆管理器 (manager.py)
-
-- **功能**：初始化记忆目录，加载核心提示，启动知识图谱工作线程
-- **核心提示**：`load_core_prompt` 读取 soul、traits、identity、user 四个 Markdown 文件作为系统提示的一部分
-- **会话记录**：`record_turn` 将用户与助手对话保存为 Markdown 文件，并加入知识图谱处理队列
-
-#### 3.3.2 知识图谱工作线程 (worker.py)
-
-- **异步处理**：使用独立线程处理对话记录，提取实体和关系
-- **信息抽取**：调用 LLM 将对话 Markdown 转换为结构化的知识图谱片段
-- **图更新**：`_upsert_graph` 负责合并新实体和关系到全局图谱
-- **哈希去重**：通过文档哈希避免重复处理
-
-#### 3.3.3 存储抽象 (storage.py)
-
-- `ChatLogStore`：按日期和会话组织聊天记录
-- `KnowledgeGraphStore`：线程安全的 JSON 存储，支持原子读写
-- **文档哈希**：使用 SHA256 检测内容变更
-
-#### 3.3.4 查询模块 (query.py)
-
-- **关键词搜索**：基于词频的简单搜索算法
-- **图谱统计**：提供节点、边、文档数量统计
-
-#### 3.3.5 路径管理 (paths.py)
-
-- 通过环境变量支持灵活配置记忆目录
-- 提供统一路径解析接口
-
-### 3.4 技能系统 (skills_*.py)
-
-#### 3.4.1 技能支持 (skills_support.py)
-
-- **技能发现**：扫描 `skills/` 目录下的 `SKILL.md` 文件，解析 Front Matter 元数据
-- **技能中间件**：`SkillMiddleware` 动态将技能目录注入系统提示
-- **缓存机制**：已加载技能内容缓存，避免重复读取
-
-#### 3.4.2 技能管理器 (skills_manager.py)
-
-- **技能操作**：安装（通过 `npx skills`）、创建、禁用、启用、删除
-- **项目隔离**：支持项目技能目录和全局技能目录
-- **外部调用**：通过子进程调用 `npx skills` 与技能生态交互
-
-#### 3.4.3 技能状态 (skills_state.py)
-
-- **持久化**：将技能禁用状态、使用统计、安装记录保存到 `.agents/skills_state.json`
-- **状态管理**：提供 `is_disabled`、`disable_skill`、`enable_skill` 等接口
-
-#### 3.4.4 当用户要求“添加技能”时的工作流程（实现视角）
-
-这里的“添加技能”包含三类动作：安装生态技能（`npx skills add`）、查找生态技能（`npx skills find`）、创建本地技能（生成 `skills/<name>/SKILL.md`）。本项目由单智能体直接调用技能管理工具完成上述动作。
-
-**A. 请求入口：用户 → Agent**
-
-- 用户提出“帮我添加/安装某个技能”“找一个技能来做 X”一类需求后，Agent 直接调用 `skills_find/skills_install/skills_create/skills_enable/skills_disable/skills_remove/...` 完成操作（工具由单智能体提供）。
-- 这些工具都委托给 `SkillManager`（[SkillManager](file:///d:/tools/agent-cli/skills/skills_manager.py#L45-L229)）：
-  - 查找：`skills_find(query)` → `SkillManager.find_via_npx` → `subprocess.run("npx skills find ...")`（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L189-L199)）。
-  - 安装：`skills_install(spec)` → `SkillManager.install_via_npx` → `subprocess.run("npx skills add ... --dir <project_skills_dir>")`，安装后重新扫描新增技能并写入安装记录（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L173-L188)）。
-  - 本地创建：`skills_create(name, description, body)` → 在项目技能目录创建 `skills/<name>/SKILL.md` 并写入 Front Matter，随后记录 installed（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L124-L149)）。
-  - 禁用/启用/删除：通过 `.agents/skills_state.json` 维护 disabled 标记，或直接删除项目技能目录下的技能文件夹（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L98-L123)）。
-
-
-**C. 安装/创建后的“生效”机制：不需要重启进程**
-
-- 所有智能体在构建时共享同一个 `SkillMiddleware`（[build_agent](file:///d:/tools/agent-cli/agents/runtime.py#L283-L331)），中间件会在每次模型调用前把“技能目录摘要”注入到系统提示里（[SkillMiddleware.wrap_model_call](file:///d:/tools/agent-cli/skills/skills_support.py#L180-L231)）。
-- 技能目录摘要由 `_SkillIndex` 动态刷新：它通过扫描所有 `SKILL.md` 的 `(path, mtime, size)` 计算 fingerprint；一旦安装/创建导致 fingerprint 变化，就重建 manifests、技能名索引与目录文本（[_SkillIndex.refresh](file:///d:/tools/agent-cli/skills/skills_support.py#L141-L152)）。
-- 当模型确实需要某个技能的细节时，才调用 `load_skill(name)` 读取对应 `SKILL.md` 的正文内容（并去掉 Front Matter），且会在内存中缓存本次会话加载结果（[_SkillIndex.load_skill](file:///d:/tools/agent-cli/skills/skills_support.py#L158-L177)）。
-- `load_skill` 会同步写入 `.agents/skills_state.json` 的使用统计（[record_skill_loaded](file:///d:/tools/agent-cli/skills/skills_state.py#L81-L98)）。
-
-#### 3.4.5 为什么“添加技能”响应慢（关键路径与原因）
-
-“慢”通常不是单点原因，而是多段耗时叠加，尤其在 Windows + npx 的组合下更明显。
-
-**1) 模型往返与工具调用次数叠加**
-
-- 单智能体模式下不再有额外的“跨智能体委派”模型调用，但如果一次交互里包含多步工具调用（find → install → scan），总体时延仍会线性叠加。
-
-**2) `npx skills ...` 子进程（最常见的大头）**
-
-- `skills_find`/`skills_install` 直接启动 `npx`（[skills_manager.py](file:///d:/tools/agent-cli/skills/skills_manager.py#L173-L199)），其耗时取决于：
-  - 首次运行时的 npm/npx 自身初始化、下载与缓存命中情况。
-  - 网络（访问 npm registry / GitHub）与代理配置。
-  - Windows 下启动 PowerShell + Node + npx 的冷启动成本（每次 subprocess 都是新进程）。
-- 这类耗时与模型无关，哪怕模型很快，整体响应仍会被 subprocess 阻塞。
-
-**3) 每次模型调用都要“扫一遍技能目录”的 I/O 开销**
-
-- `SkillMiddleware` 每次 wrap 模型调用都会调用 `skills_prompt_supplier()`，而 `_SkillIndex.get_catalog_text()` 会触发 `refresh()`（[get_catalog_text](file:///d:/tools/agent-cli/skills/skills_support.py#L154-L156)）。
-- `refresh()` 的 fingerprint 计算会对所有技能目录递归 `rglob("SKILL.md")` 并逐个 `stat()`（[_compute_skill_fingerprint](file:///d:/tools/agent-cli/skills/skills_support.py#L116-L128)）。当技能数量上升、磁盘较慢、或目录在网络盘/杀软扫描下，这部分会变成可感知的延迟。
-
-**4) 提示词变长导致模型推理变慢（技能越多越明显）**
-
-- 技能目录摘要会被拼进每次模型调用的 system prompt（[SkillMiddleware.wrap_model_call](file:///d:/tools/agent-cli/skills/skills_support.py#L185-L231)）。
-- 当 skills 很多时，“Available skills”列表本身会显著增加输入 token，导致：网络传输更大、模型前处理更重、推理时间更长、费用更高。
-
-**5) `load_skill` 写状态文件的同步磁盘写入**
-
-- 每次 `load_skill` 都会调用 `record_skill_loaded`，它会 `load_state()` → 修改 usage → `save_state()` 写回 JSON（[skills_state.py](file:///d:/tools/agent-cli/skills/skills_state.py#L20-L46) 与 [record_skill_loaded](file:///d:/tools/agent-cli/skills/skills_state.py#L81-L98)）。
-- 如果模型在一个回合里多次加载技能（或反复触发同一技能的 load），会产生频繁的同步磁盘写入。
-
-**可操作的优化方向（不改语义的前提下）**
-
-- 缓解 `npx`：优先让技能安装走长期驻留的包管理进程（或复用 node 缓存目录），并把 `skills add/find` 改成一次性批处理；必要时在企业环境配置 registry mirror / 代理。
-- 减少目录扫描：为 `_compute_skill_fingerprint` 增加节流（例如 1~2 秒内不重复扫），或改为基于目录级 mtime 的粗粒度检查再按需深扫。
-- 控制提示词体积：把“Available skills”从全量列表改为 Top-N + “使用 list_skills 查询全量”，或按类别/最近使用排序输出。
-- 降低状态写入频率：将 `record_skill_loaded` 从“每次 load 都落盘”改为“内存累计 + 定时/退出时落盘”，或做最小化写入（仅当计数变化才写且合并写）。
-
-### 3.5 工具集 (tools.py)
-
-- **文件操作**：`read_file`、`write_file`、`write_project_file`、`delete_path`、`list_dir`
-- **命令执行**：`Bash`、`run_cli`（支持超时和流式输出）
-- **记忆操作**：`memory_core_read`、`memory_core_append`、`memory_core_write`、`memory_kg_recall` 等
-- **安全限制**：禁止访问敏感文件（`agent.json`、`.env`、`.git`、密钥文件等），禁止越权访问项目根目录之外
-- **操作日志**：所有工具调用记录到 `ACTION_LOG`，用于终端显示和调试
-- **调用约定**：优先使用 `tool.invoke({...})`；同时兼容 `tool(**kwargs)` / `tool(dict)` 形式
-
-### 3.6 终端显示 (terminal_display.py)
-
-- **流式输出**：智能区分助手回复和工具输出，实时显示
-- **动作摘要**：将工具调用归纳为简洁的统计信息（如 `write_file x3`）
-- **内置命令**：提供 `/ls`、`/cat`、`/history`、`/skills` 等交互命令
-- **完成声明检测**：通过正则表达式检测未执行工具却声称完成的情况，提示用户
-
-### 3.7 系统信息 (sysinfo.py)
-
-- 收集平台、磁盘、内存、CPU、网络等系统信息
-- 主要用于调试和系统检查
-
-## 4. 代码质量评估
-
-### 4.1 代码风格
-
-- **格式化**：代码基本符合 PEP 8，缩进一致，行长度适中
-- **命名**：变量和函数命名清晰，采用蛇形命名法，类名使用驼峰
-- **类型提示**：广泛使用 `from __future__ import annotations` 和类型注解，提高可读性
-- **文档字符串**：大部分函数和工具都有文档字符串，说明参数和返回值
-
-### 4.2 注释
-
-- **总体良好**：关键算法和复杂逻辑有中文注释，便于中文开发者理解
-- **可改进**：部分函数缺乏注释，特别是工具函数和内部辅助函数
-
-### 4.3 复杂度
-
-- **函数长度**：大部分函数控制在 50 行以内，符合单一职责原则
-- **循环复杂度**：部分工具函数（如 `_upsert_graph`）逻辑较复杂，但通过辅助函数分解
-- **依赖耦合**：模块间依赖清晰，智能体之间通过工具调用解耦
-
-### 4.4 错误处理
-
-- **异常捕获**：关键操作（文件读写、子进程调用）有异常处理
-- **用户友好**：工具返回可读的错误信息，而非堆栈跟踪
-- **资源清理**：使用 `try/finally` 确保资源释放（如工作线程停止）
-
-### 4.5 测试覆盖
-
-- **未发现测试文件**：项目目前缺乏单元测试和集成测试
-- **潜在风险**：代码变更可能引入回归错误，依赖手动测试
-
-## 5. 架构与设计模式
-
-### 5.1 单智能体架构
-
-- **一体化链路**：同一智能体完成对话、规划与执行，降低额外模型往返
-- **可控性**：所有副作用仍通过工具完成（文件读写、命令执行等），便于审计与回放
-
-### 5.2 中间件模式
-
-- **SkillMiddleware**：动态修改系统提示，注入技能目录
-- **扩展性**：可轻松添加其他中间件（如日志、监控、缓存）
-
-### 5.3 工作线程模式
-
-- **KnowledgeGraphWorker**：独立线程处理耗时任务（知识图谱提取）
-- **队列缓冲**：使用 `queue.Queue` 实现生产者-消费者模型，避免阻塞主线程
-
-### 5.4 持久化策略
-
-- **JSON 存储**：技能状态、知识图谱使用 JSON 格式，便于人工查看和调试
-- **Markdown 存储**：聊天记录和核心记忆使用 Markdown，兼容普通文本编辑器
-- **目录组织**：按日期分目录存储聊天记录，避免单个目录文件过多
-
-### 5.5 配置管理
-
-- **环境变量优先**：支持通过环境变量覆盖默认配置
-- **命令行参数**：提供灵活的启动选项
-- **路径解析**：支持相对路径和绝对路径，相对路径默认按智能体根目录解析
-
-## 6. 潜在问题与改进点
-
-### 6.1 安全性
-
-- **敏感文件检测**：目前仅检测固定文件名和后缀，可能遗漏其他敏感文件
-- **改进建议**：增加正则表达式匹配敏感内容（如密码、API 密钥）
-- **命令注入**：工具参数直接拼接为命令行，存在注入风险
-- **改进建议**：使用参数列表而非字符串拼接，或增加输入验证
-
-### 6.2 性能
-
-- **知识图谱提取**：每次对话都调用 LLM 提取实体关系，可能产生较多 API 调用
-- **改进建议**：可设置阈值，仅对长度较大或重要的对话进行提取
-- **技能缓存**：技能内容缓存未设置过期时间，长期运行可能占用内存
-- **改进建议**：添加 LRU 缓存或基于文件修改时间的缓存失效
-
-### 6.3 可靠性
-
-- **错误恢复**：工作线程异常退出后未提供重启机制
-- **改进建议**：增加线程健康检查，异常时重新启动
-- **数据一致性**：知识图谱存储使用文件锁，但多进程场景可能存在问题
-- **改进建议**：考虑使用 SQLite 或小型数据库保证事务
-
-### 6.4 用户体验
-
-- **技能发现**：依赖外部 `npx skills` 命令，需要网络和 Node.js 环境
-- **改进建议**：提供离线技能包或内置常用技能
-- **提示词工程**：系统提示词较长，可能影响模型理解和响应速度
-- **改进建议**：精简提示词，或使用提示词压缩技术
-
-### 6.5 代码质量
-
-- **缺少测试**：亟需添加单元测试和集成测试
-- **改进建议**：使用 pytest 编写测试，覆盖核心工具和智能体
-- **类型安全**：虽然使用类型提示，但部分 `dict[str, object]` 类型过于宽松
-- **改进建议**：使用 TypedDict 或 dataclass 定义数据结构
-
-### 6.6 功能扩展
-
-- **插件系统**：目前仅支持技能，可扩展为通用插件系统
-- **改进建议**：定义插件接口，支持自定义工具、中间件、存储后端
-- **多模型支持**：目前主要针对 DeepSeek 优化，其他模型可能需调整
-- **改进建议**：抽象模型调用接口，支持更多模型提供商
-
-## 7. 技术栈与工具链
-
-### 7.1 核心技术
-
-- **Python 3.10+**：主开发语言
-- **LangChain**：智能体框架，工具调用，模型抽象
-- **LangGraph**：智能体流程控制（递归限制）
-- **DeepSeek API**：默认推理模型，支持 reasoning content
-
-### 7.2 数据存储
-
-- **文件系统**：主要存储介质（Markdown、JSON）
-- **JSON**：配置、状态、知识图谱
-- **Markdown**：聊天记录、核心记忆
-
-### 7.3 外部工具
-
-- **npx skills**：技能生态系统（发现、安装）
-- **MCP（Model Context Protocol）**：外部工具集成（通过配置文件）
-- **PowerShell/Bash**：跨平台命令行执行
-
-### 7.4 开发工具
-
-- **uv**：依赖管理（uv.lock）
-- **dotenv**：环境变量加载
-- **pathlib**：路径操作
-- **threading**：并发处理
-
-## 8. 总结
-
-### 8.1 项目亮点
-
-1. **架构清晰**：单智能体执行链路简洁，便于部署与调试
-2. **扩展性强**：技能系统和工具集易于扩展
-3. **记忆系统完善**：长期记忆 + 知识图谱，支持持续学习
-4. **安全考虑**：敏感文件防护，目录访问限制
-5. **用户体验**：终端显示友好，内置命令实用
-
-### 8.2 适用场景
-
-- **自动化脚本编写**：通过自然语言描述生成可执行脚本
-- **代码库维护**：代码分析、重构、文档生成
-- **个人助理**：文件管理、信息整理、知识积累
-- **技能开发**：作为技能运行时，测试和验证新技能
-
-### 8.3 发展建议
-
-1. **短期**：添加测试用例，提高代码可靠性
-2. **中期**：完善插件系统，支持更多模型和存储后端
-3. **长期**：构建技能市场，形成开发者生态
-
-### 8.4 总体评价
-
-Agent-CLI 是一个设计精良、思路清晰的智能体 CLI，在记忆系统和技能管理方面表现出色。代码质量较高，模块划分合理，具备良好的可维护性和扩展性。当前主要短板在于测试覆盖，建议在后续版本中重点加强。
-
+## CLI 交互命令
+
+在 `python run_cli.py` 交互模式下，支持以下本地命令（见 [system/terminal_display.py](system/terminal_display.py)）：
+
+- `/help`：帮助
+- `/ls [path]`、`/lsr [path]`：列目录/递归列目录
+- `/cat <path>`：查看文件（支持继续输入分页）
+- `/rm <path>`、`/rmr <path>`：删除文件/目录
+- `/pwd`、`/cd <path>`：查看/切换工作目录（限制在 project_dir 内）
+- `/history [n]`：历史输入
+- `/tools`：工具概览与当前目录信息
+- `/models [list|<name>]`：列出/切换模型（热更新 + 重建运行时）
+- `/ws [list|<name>]`：列出/切换输出工作空间（热更新 + 重建运行时）
+- `/skills`：打印技能目录
+- `/last [actions|tools|skills|all]`：查看最近一次工具/动作输出摘要
+- `/verbose <on|off>`：切换工具输出直显
+- `!<command>`：直接在 `AGENT_WORK_DIR` 下执行命令（等价于调用 `run_cli` 工具）
+
+## 技能系统（SKILL.md）
+
+### 发现与注入
+
+- 扫描 `AGENT_SKILLS_DIR` 与 `AGENT_SKILLS_DIRS` 中的 `**/SKILL.md`
+- 默认把“可用技能目录摘要”注入到 system prompt，并提供 `list_skills` / `load_skill` 工具按需加载（见 [skills/skills_support.py](skills/skills_support.py)）
+
+### SKILL.md Front Matter
+
+示例：
+
+```md
+---
+name: "my-skill"
+description: "一句话描述技能做什么"
 ---
 
-**分析完成时间**：2026-02-03
-**分析版本**：基于项目最新代码（2026/2/3 更新）
-**分析工具**：手动代码审查 + 结构分析
+# my-skill
+...
+```
+
+### 技能管理（安装/创建/禁用）
+
+智能体工具层提供：
+
+- `skills_scan / skills_disable / skills_enable / skills_remove / skills_create`
+- `skills_find / skills_install / skills_ensure`（通过 `npx skills`，见 [skills/skills_manager.py](skills/skills_manager.py)）
+
+`npx skills` 的缓存与临时目录会落在 `workspace/.agents/` 下，避免污染全局 npm 环境。
+
+## 记忆系统
+
+### 1) Core Memories（最高优先级）
+
+位于 `workspace/memory/`（默认路径，可用环境变量覆盖，见 [memory/paths.py](memory/paths.py)）：
+
+- `soul.md`
+- `traits.md`
+- `identity.md`
+- `user.md`
+
+Core Memories 会通过中间件注入到 system prompt（并带“身份确认门禁”逻辑，见 [memory/manager.py](memory/manager.py)）。
+
+### 2) 会话记忆（Episodic）
+
+每轮对话会抽取结构化信息并写入：
+
+- `workspace/memory/episodic/YYYY-MM-DD.md`
+
+抽取器会把信息按“场景（scene）”组织，并尽量保留可检索的关键词（路径/命令/版本号/错误等）。
+
+可通过工具：
+
+- `memory_session_query(question, date="")`：自然语言检索（自动推断日期与关键词）
+- `memory_session_search(date, keyword="")`：按日期范围 + 关键词搜索
+
+### 3) Rollups（日/周/月/年）
+
+自动生成汇总（默认输出到 `workspace/memory/rollups/`）：
+
+- `daily/`、`weekly/`、`monthly/`、`yearly/`
+
+Rollup 会在启动时补齐“昨天/上周/上月/去年”的到期汇总，并由系统任务定时触发（见 [agents/system_tasks.py](agents/system_tasks.py) 与 [system/manager.py](system/manager.py)）。
+
+### 4) LangGraph Store（remember/recall）
+
+用于存放“可枚举的稳定事实字段”（按 user_id 分桶），持久化文件：
+
+- `workspace/memory/langgraph_store.json`
+
+## 系统任务与提醒（Scheduler）
+
+系统调度器在 CLI 启动时自动启用（失败会降级为不启用），包含两类任务：
+
+1) 内置系统任务（见 [agents/system_tasks.py](agents/system_tasks.py)）
+- 每日 rollup
+- 日终/日初的 observer prompt
+
+2) 用户提醒（Reminders）
+- `reminder_schedule_at / reminder_schedule_in / reminder_list / reminder_cancel`
+- 状态文件：`workspace/schedules/reminders.json`（兼容迁移旧路径 `workspace/.agents/reminders.json`）
+
+## MCP（Model Context Protocol）
+
+MCP 工具通过 `AGENT_MCP_CONFIG` 指定的 JSON 加载（默认 `workspace/mcp/config.json`）。加载逻辑见：
+
+- [agents/tools.py](agents/tools.py) 中的 `load_mcp_tools_from_config`
+
+## API 服务（FastAPI + WebSocket）
+
+### 启动
+
+```bash
+python run_api.py
+```
+
+环境变量：
+
+- `AGENT_API_HOST`（默认 `127.0.0.1`）
+- `AGENT_API_PORT`（默认 `58452`）
+- `AGENT_UI_ORIGINS`（CORS allow_origins，`;` 或 `,` 分隔，默认 `*`）
+
+### 接口
+
+- `GET /health`：健康检查
+- `WS /ws`：WebSocket 聊天
+  - 发送：`{"text":"..."}`
+  - 接收：`assistant_delta`（增量）、`done`（完整文本 + tokens）、`error`、`reset`
+
+实现见 [api/app.py](api/app.py)。
+
+## Web UI（纯静态）
+
+打开 [ui/index.html](ui/index.html) 即可（不需要构建）。默认连接 `http://127.0.0.1:58452`，也可以：
+
+- 通过 URL 参数：`?api=http://<host>:58452`
+- 或在页面顶部点击后端地址写入 localStorage
+
+配置逻辑见 [ui/config.js](ui/config.js)。
+
+## 安全与边界（非常重要）
+
+### 文件访问
+
+- `write_file` 默认只能写入 `AGENT_OUTPUT_DIR`（即 out/<workspace>）及 `AGENT_EXTRA_WRITE_ROOTS` 白名单目录
+- `read_file / list_dir / write_project_file / delete_path` 只允许在 `AGENT_PROJECT_DIR` 下操作
+- 对 `agent.json`、`.env`、私钥等敏感路径有硬阻断（见 [agents/tools.py](agents/tools.py)）
+
+### 命令执行
+
+- `run_cli` 默认只允许在 `AGENT_WORK_DIR` 下执行，cwd 不能越界（可用 `AGENT_EXTRA_CWD_ROOTS` 扩展）
+- `AGENT_SANDBOX=on` 时会额外拦截危险命令模式、脚本内容以及路径逃逸（见 [agents/exec.py](agents/exec.py)）
+
+## 常见问题
+
+### 启动报错：未配置有效的 DEEPSEEK_API_KEY
+
+当 `LC_MODEL` 以 `deepseek:` 开头时，CLI 会在启动时强校验 `DEEPSEEK_API_KEY`（见 [run_cli.py](run_cli.py)）。解决方案：
+
+- 设置 `DEEPSEEK_API_KEY`（推荐放 `.env` 或系统环境变量）
+- 或切换到 OpenAI/兼容模型并配置 `OPENAI_API_KEY`（`/models <name>`）
+
+### `skills_find/skills_install` 很慢
+
+它们会启动 `npx skills ...` 子进程，首次运行可能受网络、npm 初始化与冷启动影响。此项目已将 npm 缓存/前缀/临时目录收敛到 `workspace/.agents/`，但仍建议配置镜像源或代理以提升稳定性。
