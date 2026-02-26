@@ -18,8 +18,10 @@ from langchain_core.messages import AIMessageChunk
 
 from agents.runtime import (
     _agent_stream_config,
+    _extract_text,
     _stream_text_delta,
     build_agent,
+    build_user_message,
     capture_token_usage_from_message,
     estimate_token_usage,
     get_estimated_token_usage,
@@ -33,23 +35,6 @@ from memory import paths as memory_paths
 
 
 _DOTENV_KEY_RX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-
-def _extract_text(msg: object) -> str:
-    content = getattr(msg, "content", "") or ""
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                text = item.get("text")
-                if isinstance(text, str) and text:
-                    parts.append(text)
-        return "".join(parts)
-    return str(content)
 
 
 def _load_dotenv_file(path: Path, *, override: bool) -> None:
@@ -290,7 +275,7 @@ async def ws_chat(ws: WebSocket):
     await ws.accept()
     runtime: AgentRuntime = ws.app.state.runtime
     thread_id = uuid.uuid4().hex
-    conversation: list[dict[str, str]] = []
+    conversation: list[dict[str, object]] = []
 
     while True:
         raw = await ws.receive_text()
@@ -314,7 +299,28 @@ async def ws_chat(ws: WebSocket):
             continue
         user_text = text.strip()
 
-        request_messages = [*conversation, {"role": "user", "content": user_text}]
+        images: list[str] = []
+        videos: list[str] = []
+        if isinstance(payload, dict):
+            img = payload.get("image")
+            if isinstance(img, str) and img.strip():
+                images.append(img.strip())
+            imgs = payload.get("images")
+            if isinstance(imgs, list):
+                for it in imgs:
+                    if isinstance(it, str) and it.strip():
+                        images.append(it.strip())
+            vid = payload.get("video")
+            if isinstance(vid, str) and vid.strip():
+                videos.append(vid.strip())
+            vids = payload.get("videos")
+            if isinstance(vids, list):
+                for it in vids:
+                    if isinstance(it, str) and it.strip():
+                        videos.append(it.strip())
+
+        user_msg = build_user_message(user_text, images=images or None, videos=videos or None)
+        request_messages = [*conversation, user_msg]
 
         q: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
         assistant_full: dict[str, Any] = {"text": "", "usage": None}
@@ -378,7 +384,7 @@ async def ws_chat(ws: WebSocket):
         assistant_text2 = assistant_full.get("text")
         usage2 = assistant_full.get("usage")
         if isinstance(assistant_text2, str) and assistant_text2.strip():
-            conversation.extend([{"role": "user", "content": user_text}, {"role": "assistant", "content": assistant_text2}])
+            conversation.extend([user_msg, {"role": "assistant", "content": assistant_text2}])
             if len(conversation) > 40:
                 conversation = conversation[-40:]
             try:

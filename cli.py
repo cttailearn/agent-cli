@@ -6,7 +6,7 @@ import re
 import sys
 from pathlib import Path
 
-from agents.runtime import build_agent
+from agents.runtime import build_agent, build_user_message
 from config_manager import apply_config_to_environ, load_config
 from memory import MemoryManager, ensure_memory_scaffold
 from memory import paths as memory_paths
@@ -342,7 +342,7 @@ def main() -> None:
     try:
         if args.prompt:
             user_text = " ".join(args.prompt).strip()
-            assistant_text = stream_assistant_reply(agent, [{"role": "user", "content": user_text}], state)
+            assistant_text = stream_assistant_reply(agent, [build_user_message(user_text)], state)
             usage = state.last_token_usage or {}
             if usage:
                 label = "tokens(估算)" if state.last_token_usage_is_estimate else "tokens"
@@ -380,7 +380,7 @@ def main() -> None:
                     continue
                 if local_action is not None:
                     continue
-                assistant_text = stream_assistant_reply(agent, [{"role": "user", "content": user_text}], state)
+                assistant_text = stream_assistant_reply(agent, [build_user_message(user_text)], state)
                 usage = state.last_token_usage or {}
                 if usage:
                     label = "tokens(估算)" if state.last_token_usage_is_estimate else "tokens"

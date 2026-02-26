@@ -4,14 +4,14 @@
     "请不要把真实密钥直接写进本文件：推荐使用 ${ENV_VAR} 引用系统环境变量，例如 ${DEEPSEEK_API_KEY}、${OPENAI_API_KEY}。",
     "常用命令：/models list 列出模型；/models <name> 切换模型；/ws list 列出输出工作空间；/ws <name> 切换输出工作空间。"
   ],
-  "active_model": "deepseek-chat",
+  "active_model": "qwen3.5",
   "env": {
     "AGENT_MCP_CONFIG": "mcp/config.json",
     "AGENT_MEMORY_DIR": "memory",
     "AGENT_OUTPUT_DIR": "out",
     "AGENT_PROJECT_DIR": "workspace",
     "AGENT_SESSION_MEMORY_INPUT_TOKENS_THRESHOLD": "200000",
-    "AGENT_SKILLS_DIR": "skills",
+    "AGENT_SKILLS_DIR": ".skills",
     "_comment": [
       "env：全局环境变量（对所有模型生效）。相对路径均相对 AGENT_PROJECT_DIR 解析。",
       "AGENT_OUTPUT_DIR 作为输出基目录，实际写入目录为：AGENT_OUTPUT_DIR/<output.workspace>/"
@@ -46,6 +46,17 @@
         "OPENAI_BASE_URL": "https://api-inference.modelscope.cn/v1"
       },
       "model": "moonshotai/Kimi-K2.5"
+    },
+    "qwen3.5": {
+      "_comment": [
+        "OpenAI 官方：只需 OPENAI_API_KEY；OPENAI_BASE_URL 可不填或使用默认 https://api.openai.com/v1",
+        "兼容 OpenAI 的第三方：请同时配置 OPENAI_BASE_URL（例如 https://xxx/v1）"
+      ],
+      "env": {
+        "OPENAI_API_KEY": "${CODE_OPENAI_API_KEY}",
+        "OPENAI_BASE_URL": "https://coding.dashscope.aliyuncs.com/v1"
+      },
+      "model": "qwen3.5-plus"
     }
   },
   "output": {

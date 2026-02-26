@@ -11,9 +11,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from agents import console_print
-from agents.tools import log_action
-
 from . import skills_state
 from .skills_support import discover_skills_from_dirs
 
@@ -63,6 +60,12 @@ def _extract_source_url(text: str) -> str | None:
 
 def _classify_install_failure(text: str) -> tuple[str, bool]:
     s = (text or "").lower()
+    if "invalid agents:" in s:
+        return "invalid_agents", False
+    if "repository" in s and "does not exist" in s:
+        return "repo_not_found", False
+    if "failed to clone" in s and ("not found" in s or "does not exist" in s):
+        return "repo_not_found", False
     if "clone timed out after" in s or ("failed to clone repository" in s and "timed out" in s):
         return "clone_timeout", True
     if "failed to clone repository" in s:
@@ -102,13 +105,52 @@ def _kill_process_tree(pid: int) -> None:
             pass
 
 
+def _console_print(*args: object, sep: str = " ", end: str = "\n", flush: bool = False, ensure_newline: bool = False) -> None:
+    try:
+        from agents import console_print as _cp
+
+        _cp(*args, sep=sep, end=end, flush=flush, ensure_newline=ensure_newline)
+    except Exception:
+        text = sep.join("" if a is None else str(a) for a in args)
+        if end:
+            text += end
+        print(text, end="", flush=flush)
+
+
+def _log_action(kind: str, **kwargs: object) -> None:
+    try:
+        from agents.tools import log_action as _la
+
+        _la(kind, **kwargs)
+    except Exception:
+        return
+
+
 
 class SkillManager:
     def __init__(self, *, skills_dirs: list[Path], project_root: Path, work_dir: Path) -> None:
-        self.skills_dirs = [p.resolve() for p in skills_dirs]
         self.project_root = project_root.resolve()
         self.work_dir = work_dir.resolve()
-        self.project_skills_dir = self.skills_dirs[0] if self.skills_dirs else (self.project_root / "skills").resolve()
+
+        unique_dirs: list[Path] = []
+        seen: set[str] = set()
+        for p in skills_dirs:
+            try:
+                resolved = p.resolve()
+            except Exception:
+                resolved = p
+            key = resolved.as_posix().lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique_dirs.append(resolved)
+
+        if not unique_dirs:
+            unique_dirs.append((self.project_root / ".skills").resolve())
+
+        self.skills_dirs = unique_dirs
+        self.project_skills_dir = self.skills_dirs[0]
+        self.project_skills_dir.mkdir(parents=True, exist_ok=True)
 
     def _npx_project_skills_dir(self) -> Path:
         return (self.project_root / ".agents" / "skills").resolve()
@@ -276,7 +318,7 @@ class SkillManager:
         try:
             stream = (os.environ.get("AGENT_STREAM_SUBPROCESS") or "").strip().lower() in {"1", "true", "yes", "on"}
             if stream:
-                console_print(f"$ {command}", flush=True, ensure_newline=True)
+                _console_print(f"$ {command}", flush=True, ensure_newline=True)
                 process = subprocess.Popen(
                     cmd,
                     cwd=run_cwd,
@@ -296,7 +338,7 @@ class SkillManager:
                     assert process.stdout is not None
                     for raw_line in process.stdout:
                         line = raw_line.rstrip("\n")
-                        console_print(line, flush=True, ensure_newline=True)
+                        _console_print(line, flush=True, ensure_newline=True)
                         with output_lock:
                             output_lines.append(line)
 
@@ -323,7 +365,7 @@ class SkillManager:
                 with output_lock:
                     out = "\n".join(output_lines)
                 err = ""
-                log_action(
+                _log_action(
                     "skills_subprocess",
                     ok=(exit_code == 0 and not timed_out),
                     command=command,
@@ -361,7 +403,7 @@ class SkillManager:
                     out, err = process.communicate(timeout=2)
                 except Exception:
                     out, err = "", ""
-                log_action(
+                _log_action(
                     "skills_subprocess",
                     ok=False,
                     command=command,
@@ -373,9 +415,9 @@ class SkillManager:
                 )
                 return 124, out or "", "timeout"
         except FileNotFoundError as e:
-            log_action("skills_subprocess", ok=False, command=command, cwd=run_cwd.as_posix(), error=str(e))
+            _log_action("skills_subprocess", ok=False, command=command, cwd=run_cwd.as_posix(), error=str(e))
             return 127, "", str(e)
-        log_action(
+        _log_action(
             "skills_subprocess",
             ok=(exit_code == 0),
             command=command,
@@ -389,27 +431,59 @@ class SkillManager:
         spec = (package_spec or "").strip()
         if not spec:
             return "Empty package_spec."
+        if not (shutil.which("npx") or "").strip():
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error_type": "missing_npx",
+                    "message": "npx not found. Install Node.js (includes npm/npx) or provide an offline skill directory.",
+                    "env": {
+                        "node": bool((shutil.which("node") or "").strip()),
+                        "npm": bool((shutil.which("npm") or "").strip()),
+                        "npx": False,
+                        "git": bool((shutil.which("git") or "").strip()),
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         before = {m.name for m in discover_skills_from_dirs(self.skills_dirs)}
-        cmd = f'npx --yes skills add "{spec}" -y'
+        agent_candidates = ["trae", "cursor", "cline", "claude-code", "continue"]
         last_code = 1
         last_out = ""
         last_err = ""
         attempt_count = 0
-        for i in range(max(1, int(retries) + 1)):
-            attempt_count = i + 1
-            code, out, err = self._run(cmd, timeout_s=timeout_s, cwd=self.project_root)
-            last_code, last_out, last_err = code, out, err
-            if code == 0:
+        agent_used = ""
+        stop_all = False
+        for agent in agent_candidates:
+            cmd = f'npx --yes skills add "{spec}" -y --copy --agent {agent}'
+            last_code = 1
+            last_out = ""
+            last_err = ""
+            attempt_count = 0
+            for i in range(max(1, int(retries) + 1)):
+                attempt_count = i + 1
+                code, out, err = self._run(cmd, timeout_s=timeout_s, cwd=self.project_root)
+                last_code, last_out, last_err = code, out, err
+                if code == 0:
+                    agent_used = agent
+                    break
+                combined = "\n".join([out or "", err or ""]).strip()
+                if "Invalid agents:" in combined:
+                    break
+                failure_type, retryable = _classify_install_failure(combined)
+                if failure_type in {"repo_not_found", "auth"}:
+                    stop_all = True
+                    break
+                if not retryable or i >= int(retries):
+                    break
+                time.sleep(1.0 if i == 0 else 2.0)
+            if agent_used:
                 break
-            combined = "\n".join([out or "", err or ""]).strip()
-            failure_type, retryable = _classify_install_failure(combined)
-            if not retryable or i >= int(retries):
+            if stop_all:
                 break
-            time.sleep(1.0 if i == 0 else 2.0)
 
         code, out, err = last_code, last_out, last_err
-        after = {m.name for m in discover_skills_from_dirs(self.skills_dirs)}
-        added = sorted(after - before)
         if code != 0:
             combined = "\n".join([out or "", err or ""]).strip()
             failure_type, retryable = _classify_install_failure(combined)
@@ -422,6 +496,12 @@ class SkillManager:
                     "source_url": source_url,
                     "git_ls_remote": {"exit_code": d_code, "stdout": (d_out or "").strip(), "stderr": (d_err or "").strip()},
                 }
+            suggestions: list[str] = []
+            if failure_type == "repo_not_found":
+                suggestions.append("package_spec 必须是 owner/repo 或可 clone 的 URL（例如 https://github.com/vercel-labs/agent-skills）")
+                suggestions.append('示例：skills_install("vercel-labs/agent-skills")')
+                suggestions.append(f'若你只有关键词，可先用命令检索：npx skills find "{spec}"')
+                suggestions.append(f'或命令：npx skills add "{spec}" --agent trae -y --copy')
             return json.dumps(
                 {
                     "exit_code": code,
@@ -429,24 +509,72 @@ class SkillManager:
                     "error_type": failure_type,
                     "retryable": retryable,
                     "attempts": attempt_count,
+                    "agent_tried": agent_candidates,
                     "stdout": (out or "").strip(),
                     "stderr": (err or "").strip(),
                     "diagnostics": diagnostics,
+                    "suggestions": suggestions,
                 },
                 ensure_ascii=False,
                 sort_keys=True,
             )
-        synced = self._sync_npx_project_skills_to_project_skills_dir()
+        installed_agent_dir = (self.project_root / f".{agent_used}").resolve()
+        agent_skills_root = (installed_agent_dir / "skills").resolve()
+        copied: list[str] = []
+        if agent_skills_root.exists() and agent_skills_root.is_dir():
+            for manifest in discover_skills_from_dirs([agent_skills_root]):
+                src = manifest.skill_md_path.parent.resolve()
+                dst = (self.project_skills_dir / src.name).resolve()
+                try:
+                    dst.relative_to(self.project_skills_dir)
+                except ValueError:
+                    continue
+                if dst.exists():
+                    continue
+                shutil.copytree(src, dst, dirs_exist_ok=False)
+                copied.append(dst.as_posix())
+
+        try:
+            if installed_agent_dir.exists():
+                shutil.rmtree(installed_agent_dir, ignore_errors=False)
+        except Exception:
+            pass
+
         after = {m.name for m in discover_skills_from_dirs(self.skills_dirs)}
         added = sorted(after - before)
         for n in added:
             skills_state.record_installed(n, source=f"npx:{spec}")
-        return json.dumps({"exit_code": code, "added": added, "synced": synced, "stdout": out, "stderr": err}, ensure_ascii=False)
+        return json.dumps(
+            {
+                "exit_code": code,
+                "added": added,
+                "agent_used": agent_used,
+                "copied": copied,
+                "stdout": out,
+                "stderr": err,
+            },
+            ensure_ascii=False,
+        )
 
     def find_via_npx(self, query: str, timeout_s: int = 120) -> str:
         q = (query or "").strip()
         if not q:
             return "Empty query."
+        if not (shutil.which("npx") or "").strip():
+            return json.dumps(
+                {
+                    "ok": False,
+                    "error_type": "missing_npx",
+                    "message": "npx not found. Install Node.js (includes npm/npx).",
+                    "env": {
+                        "node": bool((shutil.which("node") or "").strip()),
+                        "npm": bool((shutil.which("npm") or "").strip()),
+                        "npx": False,
+                    },
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         cmd = f'npx --yes skills find "{q}"'
         code, out, err = self._run(cmd, timeout_s=timeout_s, cwd=self.project_root)
         if code != 0:

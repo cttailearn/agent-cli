@@ -20,6 +20,7 @@ from agents.runtime import (
     estimate_token_usage,
     get_estimated_token_usage,
     get_token_usage,
+    messages_to_prompt_text_for_estimate,
     reset_estimated_token_usage,
     reset_token_usage,
     _extract_text,
@@ -167,7 +168,7 @@ def _print_last(state: CliState, kind: str) -> None:
     print("用法：/last [actions|tools|skills|all]")
 
 
-def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliState) -> str:
+def stream_assistant_reply(agent, messages: list[dict[str, object]], state: CliState) -> str:
     label = "observer"
     stream_delegation = (os.environ.get("AGENT_STREAM_DELEGATION") or "").strip().lower() in {"1", "true", "yes", "on"}
     drain_scope = label if stream_delegation else None
@@ -333,7 +334,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
     state.last_token_usage = get_token_usage()
     state.last_token_usage_is_estimate = False
     if (state.last_token_usage.get("total_tokens", 0) if state.last_token_usage else 0) <= 0:
-        prompt_text = "\n".join(str(m.get("content") or "") for m in messages)
+        prompt_text = messages_to_prompt_text_for_estimate(messages)
         state.last_token_usage = estimate_token_usage(prompt_text, reply)
         state.last_token_usage_is_estimate = True
 
@@ -365,7 +366,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, str]], state: CliStat
 
 def handle_local_command(
     user_text: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, object]],
     history: list[str],
     state: CliState,
 ) -> str | None:

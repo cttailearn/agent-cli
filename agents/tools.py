@@ -1,11 +1,14 @@
 import asyncio
 import contextvars
 import inspect
+import importlib.util
 import json
 import os
+import platform
 import re
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -13,6 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 from fnmatch import fnmatch
 from langchain_core.tools import tool
 from pathlib import Path
+import shutil
 
 from langgraph.prebuilt import ToolRuntime
 
@@ -2386,3 +2390,145 @@ def system_time() -> str:
             "install": "pip install lunar_python",
         }
     return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def env_info() -> str:
+    """Get current runtime environment information."""
+    def _which(cmd: str) -> str:
+        p = shutil.which(cmd)
+        return p or ""
+
+    def _version(cmd: str) -> str:
+        exe = _which(cmd)
+        if not exe:
+            return ""
+        out = run_cli.func(command=f"{cmd} --version", timeout_s=20, cwd=".", encoding="utf-8", stream=False)
+        return (out or "").strip()
+
+    py = sys.executable or "python"
+    data: dict[str, object] = {
+        "os": {
+            "name": os.name,
+            "platform": platform.platform(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "arch": platform.architecture()[0] if platform.architecture() else "",
+        },
+        "python": {
+            "executable": py,
+            "version": sys.version.splitlines()[0] if sys.version else "",
+            "prefix": str(getattr(sys, "prefix", "") or ""),
+            "base_prefix": str(getattr(sys, "base_prefix", "") or ""),
+        },
+        "paths": {
+            "cwd": str(Path.cwd().resolve().as_posix()),
+            "project_dir": (os.environ.get("AGENT_PROJECT_DIR") or "").strip(),
+            "work_dir": (os.environ.get("AGENT_WORK_DIR") or "").strip(),
+            "output_dir": (os.environ.get("AGENT_OUTPUT_DIR") or "").strip(),
+            "memory_dir": (os.environ.get("AGENT_MEMORY_DIR") or "").strip(),
+        },
+        "sandbox": {
+            "AGENT_SANDBOX": (os.environ.get("AGENT_SANDBOX") or "").strip(),
+        },
+        "bins": {
+            "python": _which("python"),
+            "py": _which("py"),
+            "pip": _which("pip"),
+            "uv": _which("uv"),
+            "git": _which("git"),
+            "node": _which("node"),
+            "npm": _which("npm"),
+            "npx": _which("npx"),
+        },
+        "versions": {
+            "python": _version("python"),
+            "pip": _version("pip"),
+            "uv": _version("uv"),
+            "git": _version("git"),
+            "node": _version("node"),
+            "npm": _version("npm"),
+            "npx": _version("npx"),
+        },
+    }
+    return json.dumps(data, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def env_has(command: str) -> str:
+    """Check whether a command exists in PATH."""
+    cmd = (command or "").strip()
+    if not cmd:
+        return json.dumps({"ok": False, "error": "empty_command"}, ensure_ascii=False, sort_keys=True)
+    p = shutil.which(cmd) or ""
+    return json.dumps({"ok": True, "command": cmd, "found": bool(p), "path": p}, ensure_ascii=False, sort_keys=True)
+
+
+@tool
+def env_ensure(
+    kind: str,
+    target: str,
+    import_name: str = "",
+    timeout_s: int = 600,
+) -> str:
+    """Ensure an environment dependency exists; install if possible."""
+    k = (kind or "").strip().lower()
+    t = (target or "").strip()
+    imp = (import_name or "").strip()
+    if not k or not t:
+        return json.dumps({"ok": False, "error": "missing_kind_or_target"}, ensure_ascii=False, sort_keys=True)
+
+    if k == "command":
+        p = shutil.which(t) or ""
+        return json.dumps({"ok": True, "kind": k, "target": t, "status": "present" if p else "missing", "path": p}, ensure_ascii=False, sort_keys=True)
+
+    if k == "python_package":
+        module_name = imp or t
+        present = importlib.util.find_spec(module_name) is not None
+        if present:
+            return json.dumps({"ok": True, "kind": k, "target": t, "import_name": module_name, "status": "present"}, ensure_ascii=False, sort_keys=True)
+        installer = "uv" if (shutil.which("uv") or "") else "pip"
+        if installer == "uv":
+            cmd = f'uv pip install "{t}"'
+        else:
+            cmd = f'python -m pip install --disable-pip-version-check "{t}"'
+        out = run_cli.func(command=cmd, timeout_s=int(timeout_s), cwd=".", encoding="utf-8", stream=False)
+        present2 = importlib.util.find_spec(module_name) is not None
+        return json.dumps(
+            {
+                "ok": bool(present2),
+                "kind": k,
+                "target": t,
+                "import_name": module_name,
+                "installer": installer,
+                "status": "installed" if present2 else "failed",
+                "output": (out or "").strip(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    if k == "node_tool":
+        need = [t]
+        status: dict[str, object] = {"ok": True, "kind": k, "target": t}
+        for cmd in need:
+            p = shutil.which(cmd) or ""
+            status[cmd] = {"found": bool(p), "path": p}
+        return json.dumps(status, ensure_ascii=False, sort_keys=True)
+
+    if k == "npm_package":
+        if not (shutil.which("npm") or "").strip():
+            return json.dumps(
+                {"ok": False, "kind": k, "target": t, "status": "missing_npm", "hint": "Install Node.js (includes npm)."},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        out = run_cli.func(command=f'npm install -g "{t}" --silent', timeout_s=int(timeout_s), cwd=".", encoding="utf-8", stream=False)
+        return json.dumps(
+            {"ok": True, "kind": k, "target": t, "status": "attempted_install", "output": (out or "").strip()},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    return json.dumps({"ok": False, "error": "unknown_kind", "kind": k}, ensure_ascii=False, sort_keys=True)

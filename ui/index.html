@@ -194,6 +194,68 @@
         return `tokens: in=${input} out=${output} total=${total}`;
       }
 
+      function renderRichBody(bodyEl, text) {
+        const raw = String(text || "");
+        bodyEl.dataset.raw = raw;
+        const hasMedia = /\[image\]|\[video\]|!\[[^\]]*\]\([^)]+\)/.test(raw);
+        if (!hasMedia) {
+          bodyEl.textContent = raw;
+          return;
+        }
+        while (bodyEl.firstChild) bodyEl.removeChild(bodyEl.firstChild);
+        const lines = raw.split("\n");
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const img = line.match(/^\[image\]\s*(.+)\s*$/);
+          const vid = line.match(/^\[video\]\s*(.+)\s*$/);
+          const mdImg = line.match(/^!\[[^\]]*\]\(([^)]+)\)\s*$/);
+          if (img || mdImg) {
+            const url = String((img ? img[1] : mdImg[1]) || "").trim();
+            const row = document.createElement("div");
+            const a = document.createElement("a");
+            a.href = url;
+            a.target = "_blank";
+            a.rel = "noreferrer";
+            a.textContent = url;
+            row.appendChild(a);
+            if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("data:")) {
+              const el = document.createElement("img");
+              el.src = url;
+              el.style.maxWidth = "100%";
+              el.style.borderRadius = "10px";
+              el.style.display = "block";
+              el.style.marginTop = "8px";
+              row.appendChild(el);
+            }
+            bodyEl.appendChild(row);
+          } else if (vid) {
+            const url = String(vid[1] || "").trim();
+            const row = document.createElement("div");
+            const a = document.createElement("a");
+            a.href = url;
+            a.target = "_blank";
+            a.rel = "noreferrer";
+            a.textContent = url;
+            row.appendChild(a);
+            if (url.startsWith("http:") || url.startsWith("https:") || url.startsWith("data:")) {
+              const el = document.createElement("video");
+              el.src = url;
+              el.controls = true;
+              el.style.maxWidth = "100%";
+              el.style.borderRadius = "10px";
+              el.style.display = "block";
+              el.style.marginTop = "8px";
+              row.appendChild(el);
+            }
+            bodyEl.appendChild(row);
+          } else {
+            const row = document.createElement("div");
+            row.textContent = line;
+            bodyEl.appendChild(row);
+          }
+        }
+      }
+
       function appendMessage(role, text, extraMeta) {
         const el = document.createElement("div");
         el.className = "msg " + role;
@@ -210,7 +272,7 @@
         }
         const body = document.createElement("div");
         body.className = "body";
-        body.textContent = text || "";
+        renderRichBody(body, text || "");
         el.appendChild(meta);
         el.appendChild(body);
         logEl.appendChild(el);
@@ -245,7 +307,8 @@
               currentAssistantEl = appendMessage("assistant", "");
             }
             const body = currentAssistantEl.querySelector(".body");
-            body.textContent += msg.delta || "";
+            const next = String(body.dataset.raw || "") + String(msg.delta || "");
+            renderRichBody(body, next);
             logEl.scrollTop = logEl.scrollHeight;
             return;
           }

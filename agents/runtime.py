@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import base64
+import mimetypes
 import os
+import re
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 from langchain.agents.middleware.types import AgentState
 from langchain.chat_models import init_chat_model
 from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_core.messages import AIMessageChunk, BaseMessage, BaseMessageChunk, ToolMessage, ToolMessageChunk
 from langchain_deepseek import ChatDeepSeek
+from typing import Any
 from typing_extensions import TypedDict
 
 from . import console_write
@@ -225,8 +230,244 @@ def _extract_text(msg: BaseMessage | BaseMessageChunk) -> str:
                 text = item.get("text")
                 if isinstance(text, str) and text:
                     parts.append(text)
+                image_url = item.get("image_url")
+                if isinstance(image_url, dict):
+                    url = image_url.get("url")
+                    if isinstance(url, str) and url:
+                        if url.startswith("data:"):
+                            parts.append("\n[image] (inline)\n")
+                        else:
+                            parts.append(f"\n[image] {url}\n")
+                video_url = item.get("video_url")
+                if isinstance(video_url, dict):
+                    url = video_url.get("url")
+                    if isinstance(url, str) and url:
+                        if url.startswith("data:"):
+                            parts.append("\n[video] (inline)\n")
+                        else:
+                            parts.append(f"\n[video] {url}\n")
         return "".join(parts)
     return str(content)
+
+
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff"}
+_VIDEO_EXTS = {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)]+)\)")
+_URL_RE = re.compile(r"(https?://[^\s<>\"]+)")
+_WIN_ABS_PATH_RE = re.compile(r"([A-Za-z]:\\[^\\n]+)")
+
+
+def _maybe_file_url_to_path(url: str) -> str | None:
+    u = (url or "").strip()
+    if not u.lower().startswith("file:"):
+        return None
+    parsed = urlparse(u)
+    p = unquote((parsed.path or "")).lstrip("/")
+    if not p:
+        return None
+    p = p.replace("/", "\\")
+    return p
+
+
+def _is_http_url(s: str) -> bool:
+    try:
+        p = urlparse(s)
+    except Exception:
+        return False
+    return (p.scheme or "").lower() in {"http", "https"}
+
+
+def _normalize_media_ref(raw: str) -> str:
+    s = (raw or "").strip().strip("<>").strip().strip("'\"")
+    return s
+
+
+def _path_suffix_lower(s: str) -> str:
+    try:
+        return Path(s).suffix.lower()
+    except Exception:
+        return ""
+
+
+def _dedupe_preserve_order(items: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for it in items:
+        key = (it or "").strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def _extract_media_refs_from_text(user_text: str) -> tuple[list[str], list[str]]:
+    text = user_text or ""
+    images: list[str] = []
+    videos: list[str] = []
+
+    for m in _MD_IMAGE_RE.finditer(text):
+        ref = _normalize_media_ref(m.group(1))
+        if ref:
+            images.append(ref)
+
+    for m in _URL_RE.finditer(text):
+        ref = _normalize_media_ref(m.group(1))
+        suf = _path_suffix_lower(ref)
+        if suf in _IMAGE_EXTS:
+            images.append(ref)
+        elif suf in _VIDEO_EXTS:
+            videos.append(ref)
+
+    for m in _WIN_ABS_PATH_RE.finditer(text):
+        ref = _normalize_media_ref(m.group(1))
+        suf = _path_suffix_lower(ref)
+        if suf in _IMAGE_EXTS:
+            images.append(ref)
+        elif suf in _VIDEO_EXTS:
+            videos.append(ref)
+
+    tokens = re.split(r"[\s,;]+", text)
+    for tok in tokens:
+        ref = _normalize_media_ref(tok)
+        if not ref:
+            continue
+        if _is_http_url(ref) or ref.lower().startswith("data:") or ref.lower().startswith("file:"):
+            continue
+        suf = _path_suffix_lower(ref)
+        if suf in _IMAGE_EXTS:
+            images.append(ref)
+        elif suf in _VIDEO_EXTS:
+            videos.append(ref)
+
+    return _dedupe_preserve_order(images), _dedupe_preserve_order(videos)
+
+
+def _data_url_for_local_file(path_str: str, *, max_bytes: int) -> str | None:
+    try:
+        p = Path(path_str).expanduser()
+    except Exception:
+        return None
+    if not p.is_absolute():
+        try:
+            p = (Path.cwd() / p)
+        except Exception:
+            return None
+    try:
+        p = p.resolve()
+    except OSError:
+        return None
+    if not p.exists() or not p.is_file():
+        return None
+    try:
+        data = p.read_bytes()
+    except OSError:
+        return None
+    if max_bytes > 0 and len(data) > max_bytes:
+        return None
+    mime, _ = mimetypes.guess_type(p.as_posix())
+    mime = mime or "application/octet-stream"
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
+def build_user_message(
+    user_text: str,
+    *,
+    images: list[str] | None = None,
+    videos: list[str] | None = None,
+    max_inline_bytes: int | None = None,
+) -> dict[str, Any]:
+    text = (user_text or "").strip()
+    imgs = list(images) if isinstance(images, list) else None
+    vids = list(videos) if isinstance(videos, list) else None
+    if imgs is None or vids is None:
+        auto_imgs, auto_vids = _extract_media_refs_from_text(text)
+        if imgs is None:
+            imgs = auto_imgs
+        if vids is None:
+            vids = auto_vids
+
+    imgs = _dedupe_preserve_order(imgs or [])
+    vids = _dedupe_preserve_order(vids or [])
+
+    if not imgs and not vids:
+        return {"role": "user", "content": text}
+
+    if isinstance(max_inline_bytes, int):
+        max_bytes = max_inline_bytes
+    else:
+        raw_limit = (os.environ.get("AGENT_MEDIA_MAX_INLINE_BYTES") or "").strip()
+        if raw_limit:
+            try:
+                max_bytes = int(raw_limit)
+            except ValueError:
+                max_bytes = 6_000_000
+        else:
+            max_bytes = 6_000_000
+    parts: list[dict[str, Any]] = []
+    if text:
+        parts.append({"type": "text", "text": text})
+
+    for ref in imgs:
+        ref2 = _normalize_media_ref(ref)
+        if not ref2:
+            continue
+        file_path = _maybe_file_url_to_path(ref2)
+        if file_path:
+            ref2 = file_path
+        if ref2.lower().startswith("data:") or _is_http_url(ref2):
+            parts.append({"type": "image_url", "image_url": {"url": ref2}})
+            continue
+        data_url = _data_url_for_local_file(ref2, max_bytes=max_bytes)
+        if data_url:
+            parts.append({"type": "image_url", "image_url": {"url": data_url}})
+        else:
+            parts.append({"type": "text", "text": f"[image] {ref2}"})
+
+    for ref in vids:
+        ref2 = _normalize_media_ref(ref)
+        if not ref2:
+            continue
+        parts.append({"type": "text", "text": f"[video] {ref2}"})
+
+    return {"role": "user", "content": parts}
+
+
+def messages_to_prompt_text_for_estimate(messages: list[dict[str, object]]) -> str:
+    lines: list[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if isinstance(content, str):
+            lines.append(content)
+            continue
+        if isinstance(content, list):
+            parts: list[str] = []
+            for it in content:
+                if isinstance(it, str):
+                    parts.append(it)
+                    continue
+                if not isinstance(it, dict):
+                    continue
+                t = it.get("text")
+                if isinstance(t, str) and t:
+                    parts.append(t)
+                    continue
+                image_url = it.get("image_url")
+                if isinstance(image_url, dict) and isinstance(image_url.get("url"), str) and image_url.get("url"):
+                    parts.append("[image]")
+                    continue
+                video_url = it.get("video_url")
+                if isinstance(video_url, dict) and isinstance(video_url.get("url"), str) and video_url.get("url"):
+                    parts.append("[video]")
+                    continue
+            lines.append("".join(parts))
+            continue
+        lines.append(str(content or ""))
+    return "\n".join(lines)
 
 
 def _summarize_tool_output_for_terminal(raw: str) -> str:
@@ -342,7 +583,7 @@ def _stream_text_delta(new_text: str, *, assembled: str) -> tuple[str, str]:
 
 
 
-def stream_nested_agent_reply(agent, messages: list[dict[str, str]], *, label: str, thread_id: str | None = None) -> tuple[str, str]:
+def stream_nested_agent_reply(agent, messages: list[dict[str, Any]], *, label: str, thread_id: str | None = None) -> tuple[str, str]:
     snapshot = action_log_snapshot()
     last_action_index = 0
     usage_before = get_token_usage()
@@ -439,7 +680,7 @@ def stream_nested_agent_reply(agent, messages: list[dict[str, str]], *, label: s
     usage_after = get_token_usage()
     delta = _diff_token_usage(usage_after, usage_before)
     if delta.get("total_tokens", 0) <= 0:
-        prompt_text = "\n".join(str(m.get("content") or "") for m in messages)
+        prompt_text = messages_to_prompt_text_for_estimate(messages)
         est = estimate_token_usage(prompt_text, reply)
         add_estimated_token_usage(est)
         _write_out(
@@ -467,7 +708,7 @@ def _recursion_limit() -> int:
 
 def _run_agent_to_text(
     agent,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     *,
     checkpoint_ns: str = "observer",
     thread_id: str | None = None,
