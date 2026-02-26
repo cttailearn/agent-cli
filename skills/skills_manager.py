@@ -45,17 +45,31 @@ def _safe_skill_name(name: str) -> str:
     return n[:80]
 
 
-def _extract_source_url(text: str) -> str | None:
+def _extract_source_ref(text: str) -> tuple[str | None, str | None]:
+    url: str | None = None
+    hint: str | None = None
     for raw in (text or "").splitlines():
         line = raw.strip()
         if not line:
             continue
         if line.startswith("◇") or line.startswith("│"):
-            m = re.search(r"\bSource:\s*(https?://\S+)", line)
+            m = re.search(r"\bSource:\s*(https?://\S+)(?:\s+@([A-Za-z0-9_.-]+))?", line)
             if m:
-                return m.group(1).strip()
-    m = re.search(r"\bSource:\s*(https?://\S+)", text or "")
-    return m.group(1).strip() if m else None
+                url = (m.group(1) or "").strip() or None
+                hint = (m.group(2) or "").strip() or None
+                if url:
+                    return url, hint
+    m = re.search(r"\bSource:\s*(https?://\S+)(?:\s+@([A-Za-z0-9_.-]+))?", text or "")
+    if not m:
+        return None, None
+    url = (m.group(1) or "").strip() or None
+    hint = (m.group(2) or "").strip() or None
+    return url, hint
+
+
+def _extract_source_url(text: str) -> str | None:
+    url, _ = _extract_source_ref(text)
+    return url
 
 
 def _classify_install_failure(text: str) -> tuple[str, bool]:
@@ -307,7 +321,15 @@ class SkillManager:
         skills_state.record_installed(n, source="local:create")
         return f"Created: {skill_md.as_posix()}"
 
-    def _run(self, command: str, timeout_s: int, *, cwd: Path | None = None) -> tuple[int, str, str]:
+    def _run(
+        self,
+        command: str,
+        timeout_s: int,
+        *,
+        cwd: Path | None = None,
+        stream: bool | None = None,
+        early_abort_patterns: list[str] | None = None,
+    ) -> tuple[int, str, str]:
         run_cwd = (cwd or self.work_dir).resolve()
         try:
             run_cwd.relative_to(self.project_root)
@@ -316,8 +338,12 @@ class SkillManager:
         cmd = _shell_command(command)
         env = self._subprocess_env()
         try:
-            stream = (os.environ.get("AGENT_STREAM_SUBPROCESS") or "").strip().lower() in {"1", "true", "yes", "on"}
-            if stream:
+            resolved_stream = (
+                stream
+                if stream is not None
+                else (os.environ.get("AGENT_STREAM_SUBPROCESS") or "").strip().lower() in {"1", "true", "yes", "on"}
+            )
+            if resolved_stream:
                 _console_print(f"$ {command}", flush=True, ensure_newline=True)
                 process = subprocess.Popen(
                     cmd,
@@ -333,6 +359,14 @@ class SkillManager:
                 )
                 output_lines: list[str] = []
                 output_lock = threading.Lock()
+                abort_event = threading.Event()
+                abort_reason: list[str] = [""]
+                compiled_abort: list[re.Pattern[str]] = []
+                for p in early_abort_patterns or []:
+                    try:
+                        compiled_abort.append(re.compile(p, re.IGNORECASE))
+                    except re.error:
+                        continue
 
                 def _reader() -> None:
                     assert process.stdout is not None
@@ -341,12 +375,38 @@ class SkillManager:
                         _console_print(line, flush=True, ensure_newline=True)
                         with output_lock:
                             output_lines.append(line)
+                        if compiled_abort and not abort_event.is_set():
+                            for r in compiled_abort:
+                                if r.search(line):
+                                    abort_reason[0] = line
+                                    abort_event.set()
+                                    break
 
                 t = threading.Thread(target=_reader, daemon=True)
                 t.start()
                 timed_out = False
+                early_aborted = False
                 try:
-                    exit_code = process.wait(timeout=timeout_s)
+                    if compiled_abort:
+                        end_at = time.monotonic() + max(1, int(timeout_s))
+                        while True:
+                            remaining = end_at - time.monotonic()
+                            if remaining <= 0:
+                                raise subprocess.TimeoutExpired(cmd, timeout_s)
+                            try:
+                                exit_code = process.wait(timeout=min(0.25, remaining))
+                                break
+                            except subprocess.TimeoutExpired:
+                                if abort_event.is_set():
+                                    early_aborted = True
+                                    _kill_process_tree(int(process.pid or 0))
+                                    try:
+                                        exit_code = process.wait(timeout=5)
+                                    except Exception:
+                                        exit_code = 125
+                                    break
+                    else:
+                        exit_code = process.wait(timeout=timeout_s)
                 except subprocess.TimeoutExpired:
                     timed_out = True
                     _kill_process_tree(int(process.pid or 0))
@@ -367,7 +427,7 @@ class SkillManager:
                 err = ""
                 _log_action(
                     "skills_subprocess",
-                    ok=(exit_code == 0 and not timed_out),
+                    ok=(exit_code == 0 and not timed_out and not early_aborted),
                     command=command,
                     cwd=run_cwd.as_posix(),
                     exit_code=exit_code,
@@ -376,6 +436,8 @@ class SkillManager:
                 )
                 if timed_out:
                     return 124, out, "timeout"
+                if early_aborted:
+                    return 125, out, (abort_reason[0] or "early_abort")
                 return exit_code, out, err
 
             process = subprocess.Popen(
@@ -423,9 +485,96 @@ class SkillManager:
             command=command,
             cwd=run_cwd.as_posix(),
             exit_code=exit_code,
-            stream=False,
+            stream=False if stream is None else bool(stream),
         )
         return exit_code, out or "", err or ""
+
+    def _install_from_git_source(self, source_url: str, hint: str | None, *, timeout_s: int) -> dict[str, object]:
+        src = (source_url or "").strip()
+        if not src:
+            return {"ok": False, "error_type": "missing_source_url"}
+        if not (shutil.which("git") or "").strip():
+            return {"ok": False, "error_type": "missing_git", "message": "git not found in PATH."}
+        base = (self.project_root / ".agents" / "tmp").resolve()
+        base.mkdir(parents=True, exist_ok=True)
+        tmp_name = f"skills-src-{int(time.time())}-{os.getpid()}"
+        clone_dir = (base / tmp_name).resolve()
+        try:
+            clone_dir.relative_to(base)
+        except ValueError:
+            return {"ok": False, "error_type": "tmp_escape"}
+        if clone_dir.exists():
+            shutil.rmtree(clone_dir, ignore_errors=True)
+
+        clone_cmd = f'git clone --depth 1 "{src}" "{clone_dir.as_posix()}"'
+        c_code, c_out, c_err = self._run(
+            clone_cmd,
+            timeout_s=max(60, int(timeout_s)),
+            cwd=self.project_root,
+            stream=True,
+            early_abort_patterns=[
+                r"authentication",
+                r"permission denied",
+                r"could not read username",
+                r"fatal:.*not found",
+            ],
+        )
+        if c_code != 0:
+            combined = "\n".join([c_out or "", c_err or ""]).strip()
+            f_type, retryable = _classify_install_failure(combined)
+            return {
+                "ok": False,
+                "error_type": "git_clone_failed",
+                "retryable": retryable,
+                "exit_code": c_code,
+                "stdout": (c_out or "").strip(),
+                "stderr": (c_err or "").strip(),
+                "failure_type": f_type,
+            }
+
+        skill_dirs: list[Path] = []
+        for p in clone_dir.rglob("SKILL.md"):
+            try:
+                p.relative_to(clone_dir)
+            except ValueError:
+                continue
+            if p.is_file():
+                skill_dirs.append(p.parent.resolve())
+        picked: list[Path] = []
+        hint_norm = (hint or "").strip()
+        if hint_norm:
+            for d in skill_dirs:
+                if d.name == hint_norm:
+                    picked.append(d)
+        if not picked:
+            picked = skill_dirs
+
+        before = {m.name for m in discover_skills_from_dirs(self.skills_dirs)}
+        copied: list[str] = []
+        for d in sorted(picked, key=lambda x: x.name.lower()):
+            dst = (self.project_skills_dir / d.name).resolve()
+            try:
+                dst.relative_to(self.project_skills_dir)
+            except ValueError:
+                continue
+            if dst.exists():
+                continue
+            if not (d / "SKILL.md").exists():
+                continue
+            shutil.copytree(d, dst, dirs_exist_ok=False)
+            copied.append(dst.as_posix())
+
+        after = {m.name for m in discover_skills_from_dirs(self.skills_dirs)}
+        added = sorted(after - before)
+        for n in added:
+            skills_state.record_installed(n, source=f"git:{src}{'@' + hint_norm if hint_norm else ''}")
+
+        try:
+            shutil.rmtree(clone_dir, ignore_errors=False)
+        except Exception:
+            pass
+
+        return {"ok": True, "added": added, "copied": copied, "source_url": src, "hint": hint_norm}
 
     def install_via_npx(self, package_spec: str, timeout_s: int = 600, retries: int = 2) -> str:
         spec = (package_spec or "").strip()
@@ -452,7 +601,14 @@ class SkillManager:
         last_code = 1
         last_out = ""
         last_err = ""
+        last_combined = ""
+        last_failure_type = "unknown"
+        last_retryable = False
+        last_source_url: str | None = None
+        last_source_hint: str | None = None
         attempt_count = 0
+        attempts_total = 0
+        attempt_log: list[dict[str, object]] = []
         agent_used = ""
         stop_all = False
         for agent in agent_candidates:
@@ -463,18 +619,65 @@ class SkillManager:
             attempt_count = 0
             for i in range(max(1, int(retries) + 1)):
                 attempt_count = i + 1
-                code, out, err = self._run(cmd, timeout_s=timeout_s, cwd=self.project_root)
+                attempts_total += 1
+                code, out, err = self._run(
+                    cmd,
+                    timeout_s=min(int(timeout_s), 240) if i == 0 else int(timeout_s),
+                    cwd=self.project_root,
+                    stream=True,
+                    early_abort_patterns=[
+                        r"\bfailed to clone repository\b",
+                        r"\bclone timed out\b",
+                        r"\binstallation failed\b",
+                        r"\binvalid agents:\b",
+                        r"\bauthentication\b",
+                        r"\bpermission denied\b",
+                    ],
+                )
                 last_code, last_out, last_err = code, out, err
                 if code == 0:
                     agent_used = agent
                     break
                 combined = "\n".join([out or "", err or ""]).strip()
+                last_combined = combined
                 if "Invalid agents:" in combined:
                     break
                 failure_type, retryable = _classify_install_failure(combined)
+                last_failure_type, last_retryable = failure_type, retryable
+                source_url, source_hint = _extract_source_ref(combined)
+                last_source_url, last_source_hint = source_url, source_hint
+                attempt_log.append(
+                    {
+                        "agent": agent,
+                        "attempt": attempt_count,
+                        "exit_code": code,
+                        "failure_type": failure_type,
+                        "retryable": retryable,
+                        "source_url": source_url or "",
+                        "source_hint": source_hint or "",
+                    }
+                )
                 if failure_type in {"repo_not_found", "auth"}:
                     stop_all = True
                     break
+                if failure_type in {"clone_timeout", "clone_failed", "network", "timeout"} and source_url:
+                    direct = self._install_from_git_source(source_url, source_hint, timeout_s=max(180, int(timeout_s)))
+                    if bool(direct.get("ok")):
+                        return json.dumps(
+                            {
+                                "ok": True,
+                                "exit_code": 0,
+                                "added": direct.get("added", []),
+                                "copied": direct.get("copied", []),
+                                "method": "git_clone_fallback",
+                                "source_url": direct.get("source_url", source_url),
+                                "hint": direct.get("hint", source_hint or ""),
+                                "attempts_total": attempts_total,
+                                "agent_tried": agent_candidates,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
                 if not retryable or i >= int(retries):
                     break
                 time.sleep(1.0 if i == 0 else 2.0)
@@ -485,9 +688,9 @@ class SkillManager:
 
         code, out, err = last_code, last_out, last_err
         if code != 0:
-            combined = "\n".join([out or "", err or ""]).strip()
+            combined = last_combined or "\n".join([out or "", err or ""]).strip()
             failure_type, retryable = _classify_install_failure(combined)
-            source_url = _extract_source_url(combined)
+            source_url, source_hint = _extract_source_ref(combined)
             diagnostics: dict[str, object] = {}
             if source_url:
                 diag_cmd = f'git ls-remote "{source_url}"'
@@ -502,6 +705,31 @@ class SkillManager:
                 suggestions.append('示例：skills_install("vercel-labs/agent-skills")')
                 suggestions.append(f'若你只有关键词，可先用命令检索：npx skills find "{spec}"')
                 suggestions.append(f'或命令：npx skills add "{spec}" --agent trae -y --copy')
+            if failure_type in {"clone_timeout", "timeout"}:
+                suggestions.append("网络或代理导致 clone 超时：检查代理/公司网络/防火墙，或切换网络后重试")
+                if source_url:
+                    suggestions.append(f'可手动验证：git ls-remote "{source_url}"')
+            if failure_type in {"network"}:
+                suggestions.append("网络不稳定：重试，或配置 npm/git 的代理后重试")
+            if failure_type in {"auth"}:
+                suggestions.append("私有仓库需要鉴权：确保已配置 SSH key 或 GitHub CLI 登录（gh auth status）")
+                suggestions.append("若使用 HTTPS：检查凭据管理器/Token 权限；若使用 SSH：检查 ssh-add -l")
+            if failure_type in {"clone_failed"}:
+                suggestions.append("clone 失败但非鉴权/不存在：可能是网络抖动或 git 配置问题，建议手动 git clone 验证")
+                if source_url and source_hint:
+                    suggestions.append(f"如果仓库较大，可只安装该技能目录：{source_hint}")
+
+            msg = ""
+            if failure_type == "clone_timeout":
+                msg = "克隆仓库超时，已自动终止并重试；仍失败。"
+            elif failure_type == "auth":
+                msg = "仓库需要鉴权或无权限访问，已停止重试。"
+            elif failure_type == "repo_not_found":
+                msg = "仓库不存在或不可访问，已停止重试。"
+            elif failure_type in {"network", "timeout"}:
+                msg = "网络超时/异常，已自动重试；仍失败。"
+            else:
+                msg = "技能安装失败。"
             return json.dumps(
                 {
                     "exit_code": code,
@@ -509,7 +737,12 @@ class SkillManager:
                     "error_type": failure_type,
                     "retryable": retryable,
                     "attempts": attempt_count,
+                    "attempts_total": attempts_total,
                     "agent_tried": agent_candidates,
+                    "source_url": source_url or "",
+                    "source_hint": source_hint or "",
+                    "message": msg,
+                    "attempt_log": attempt_log[-10:],
                     "stdout": (out or "").strip(),
                     "stderr": (err or "").strip(),
                     "diagnostics": diagnostics,
