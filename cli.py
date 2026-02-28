@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
 from pathlib import Path
 
+from agents import console_print, console_write
 from agents.runtime import build_agent, build_user_message
 from config_manager import apply_config_to_environ, load_config
 from memory import MemoryManager, ensure_memory_scaffold
@@ -49,16 +51,95 @@ def _load_dotenv_file(path: Path, *, override: bool) -> None:
             os.environ.setdefault(k, v)
 
 
+def _dotenv_parse(path: Path) -> dict[str, str]:
+    try:
+        p = path.expanduser().resolve()
+    except Exception:
+        p = path
+    if not p.exists() or not p.is_file():
+        return {}
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    for raw_line in (text or "").lstrip("\ufeff").splitlines():
+        line = (raw_line or "").strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export ") :].strip()
+        if "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k = (k or "").strip()
+        if not k or not _DOTENV_KEY_RX.fullmatch(k):
+            continue
+        v = (v or "").strip()
+        if len(v) >= 2 and ((v[0] == v[-1] == '"') or (v[0] == v[-1] == "'")):
+            v = v[1:-1]
+        out[k] = v
+    return out
+
+
+def _apply_workspace_dotenv(path: Path, *, prev: dict[str, str]) -> dict[str, str]:
+    cur = _dotenv_parse(path)
+    removed = set(prev.keys()) - set(cur.keys())
+    for k in removed:
+        try:
+            if os.environ.get(k) == prev.get(k):
+                os.environ.pop(k, None)
+        except Exception:
+            pass
+    for k, v in cur.items():
+        os.environ[k] = v
+    return cur
+
+
+def _resolve_project_root_guess(script_root: Path) -> Path:
+    raw = (os.environ.get("AGENT_PROJECT_DIR") or "").strip() or "workspace"
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = (script_root / p).resolve()
+    else:
+        p = p.resolve()
+    return p
+
+
+def _resolve_effective_config_path(*, script_root: Path, project_root_guess: Path, explicit_config: str) -> Path:
+    if (explicit_config or "").strip():
+        p = Path(explicit_config).expanduser()
+        try:
+            return p.resolve()
+        except Exception:
+            return p
+    ws_cfg = (project_root_guess / "agent.json").resolve()
+    if ws_cfg.exists() and ws_cfg.is_file():
+        return ws_cfg
+    return (script_root / "agent.json").resolve()
+
+
 def main() -> None:
     script_root = Path(__file__).resolve().parent
     try:
         cwd = Path.cwd().resolve()
     except Exception:
         cwd = Path.cwd()
+    explicit_config_raw = (os.environ.get("AGENT_CONFIG_PATH") or "").strip()
     _load_dotenv_file(cwd / ".env", override=False)
     if cwd != script_root:
         _load_dotenv_file(script_root / ".env", override=False)
-    config_path = Path(os.environ.get("AGENT_CONFIG_PATH") or (script_root / "agent.json"))
+
+    project_root_guess = _resolve_project_root_guess(script_root)
+    workspace_env_path = (project_root_guess / ".env").resolve()
+    workspace_env: dict[str, str] = {}
+    workspace_env = _apply_workspace_dotenv(workspace_env_path, prev=workspace_env)
+
+    config_path = _resolve_effective_config_path(
+        script_root=script_root,
+        project_root_guess=project_root_guess,
+        explicit_config=explicit_config_raw,
+    )
     try:
         config_path = config_path.expanduser().resolve()
     except Exception:
@@ -68,6 +149,18 @@ def main() -> None:
     os.environ["AGENT_CONFIG_PATH"] = str(config_path)
     cfg = load_config(config_path) or {}
     apply_config_to_environ(cfg, override=False)
+    project_root_guess2 = _resolve_project_root_guess(script_root)
+    if project_root_guess2.resolve() != project_root_guess.resolve():
+        project_root_guess = project_root_guess2
+        workspace_env_path = (project_root_guess / ".env").resolve()
+        workspace_env = _apply_workspace_dotenv(workspace_env_path, prev=workspace_env)
+        if not explicit_config_raw:
+            ws_cfg2 = (project_root_guess / "agent.json").resolve()
+            if ws_cfg2.exists() and ws_cfg2.is_file() and ws_cfg2 != config_path:
+                config_path = ws_cfg2
+                os.environ["AGENT_CONFIG_PATH"] = str(config_path)
+                cfg = load_config(config_path) or {}
+                apply_config_to_environ(cfg, override=True)
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -239,6 +332,35 @@ def main() -> None:
 
     agent, state = _build_agent()
 
+    last_prompt = ""
+
+    def _notify_user(payload: dict[str, object]) -> None:
+        nonlocal last_prompt
+        body = ""
+        if isinstance(payload, dict):
+            a = payload.get("assistant")
+            if isinstance(a, str) and a.strip():
+                body = a.strip()
+            if not body:
+                t = payload.get("text")
+                if isinstance(t, str) and t.strip():
+                    body = t.strip()
+            if not body:
+                m = payload.get("message")
+                if isinstance(m, str) and m.strip():
+                    body = m.strip()
+        if not body:
+            try:
+                body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+            except Exception:
+                body = str(payload)
+        console_print(body, ensure_newline=True, flush=True)
+        if last_prompt:
+            try:
+                console_write(last_prompt, flush=True)
+            except Exception:
+                pass
+
     system_manager: SystemManager | None = None
     try:
         system_manager = SystemManager(
@@ -248,6 +370,7 @@ def main() -> None:
             model_name=model_name,
             observer_agent=agent,
             memory_manager=memory_manager,
+            notify_user=_notify_user,
         )
         system_manager.start()
     except Exception:
@@ -260,7 +383,10 @@ def main() -> None:
         except Exception:
             return 0.0, 0
 
+    workspace_env_path = (project_root / ".env").resolve()
+    workspace_env = _apply_workspace_dotenv(workspace_env_path, prev=workspace_env)
     last_cfg_sig = _config_signature(config_path)
+    last_ws_env_sig = _config_signature(workspace_env_path)
 
     def _sync_runtime_from_environ(*, force_rebuild: bool) -> bool:
         nonlocal model_name, output_workspace, output_dir, output_base_dir, work_dir, agent, state, system_manager, memory_manager
@@ -322,6 +448,7 @@ def main() -> None:
                     model_name=model_name,
                     observer_agent=agent,
                     memory_manager=memory_manager,
+                    notify_user=_notify_user,
                 )
                 system_manager.start()
             except Exception:
@@ -330,9 +457,27 @@ def main() -> None:
         return need_rebuild or force_rebuild
 
     def _reload_from_config_if_changed() -> bool:
-        nonlocal last_cfg_sig
+        nonlocal last_cfg_sig, last_ws_env_sig, config_path, workspace_env_path, workspace_env
+        project_cfg = (project_root / "agent.json").resolve()
+        if not explicit_config_raw:
+            next_cfg = project_cfg if project_cfg.exists() and project_cfg.is_file() else (script_root / "agent.json").resolve()
+        else:
+            next_cfg = config_path
+
+        env_sig = _config_signature((project_root / ".env").resolve())
+        env_changed = env_sig != last_ws_env_sig
+        if env_changed:
+            last_ws_env_sig = env_sig
+            workspace_env_path = (project_root / ".env").resolve()
+            workspace_env = _apply_workspace_dotenv(workspace_env_path, prev=workspace_env)
+
+        if next_cfg != config_path:
+            config_path = next_cfg
+            os.environ["AGENT_CONFIG_PATH"] = str(config_path)
+            last_cfg_sig = (0.0, 0)
+
         sig = _config_signature(config_path)
-        if sig == last_cfg_sig:
+        if (not env_changed) and sig == last_cfg_sig:
             return False
         last_cfg_sig = sig
         cfg2 = load_config(config_path) or {}
@@ -346,17 +491,17 @@ def main() -> None:
             usage = state.last_token_usage or {}
             if usage:
                 label = "tokens(估算)" if state.last_token_usage_is_estimate else "tokens"
-                print(
+                console_print(
                     f"{label}: input={usage.get('input_tokens', 0)} output={usage.get('output_tokens', 0)} total={usage.get('total_tokens', 0)}"
                 )
             memory_manager.record_turn(user_text=user_text, assistant_text=assistant_text, token_usage=usage if usage else None)
             return
 
         if state.skill_count:
-            print(f"已发现 {state.skill_count} 个技能，输入 /skills 查看目录。")
+            console_print(f"已发现 {state.skill_count} 个技能，输入 /skills 查看目录。", ensure_newline=True)
         else:
-            print("未发现可用技能。")
-        print("直接回车退出。输入 /help 查看内置命令。")
+            console_print("未发现可用技能。", ensure_newline=True)
+        console_print("直接回车退出。输入 /help 查看内置命令。", ensure_newline=True)
         messages: list[dict[str, str]] = []
         history: list[str] = []
         try:
@@ -368,8 +513,22 @@ def main() -> None:
                     prompt = f"{rel or '.'}> "
                 except Exception:
                     prompt = "> "
-                user_text = input(prompt).strip()
+                last_prompt = prompt
+                try:
+                    console_write(prompt, flush=True)
+                    raw_line = sys.stdin.readline()
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    raw_line = ""
+                if raw_line == "":
+                    console_print("\n已退出。", ensure_newline=True)
+                    break
+                user_text = (raw_line or "").strip()
                 if not user_text:
+                    break
+                if user_text.strip().lower() in {"exit", "quit", "q", ":q"}:
+                    console_print("已退出。", ensure_newline=True)
                     break
                 history.append(user_text)
                 local_action = handle_local_command(user_text, messages, history, state)
@@ -384,7 +543,7 @@ def main() -> None:
                 usage = state.last_token_usage or {}
                 if usage:
                     label = "tokens(估算)" if state.last_token_usage_is_estimate else "tokens"
-                    print(
+                    console_print(
                         f"{label}: input={usage.get('input_tokens', 0)} output={usage.get('output_tokens', 0)} total={usage.get('total_tokens', 0)}"
                     )
                 memory_manager.record_turn(
@@ -393,7 +552,7 @@ def main() -> None:
                     token_usage=usage if usage else None,
                 )
         except KeyboardInterrupt:
-            print("\n已退出。")
+            console_print("\n已退出。", ensure_newline=True)
     finally:
         if system_manager is not None:
             try:

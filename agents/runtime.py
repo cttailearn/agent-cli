@@ -712,6 +712,7 @@ def _run_agent_to_text(
     *,
     checkpoint_ns: str = "observer",
     thread_id: str | None = None,
+    user_id: str | None = None,
 ) -> tuple[str, str]:
     try:
         from langgraph.errors import GraphRecursionError
@@ -729,7 +730,7 @@ def _run_agent_to_text(
                 for event in agent.stream(
                     {"messages": messages},
                     stream_mode="messages",
-                    config=_agent_stream_config(checkpoint_ns=checkpoint_ns, thread_id=active_thread_id),
+                    config=_agent_stream_config(checkpoint_ns=checkpoint_ns, thread_id=active_thread_id, user_id=user_id),
                 ):
                     if isinstance(event, tuple) and event:
                         msg = event[0]
@@ -774,11 +775,14 @@ def _ensure_user_id() -> str:
     return "default"
 
 
-def _agent_stream_config(*, checkpoint_ns: str, thread_id: str | None = None) -> dict[str, object]:
+def _agent_stream_config(*, checkpoint_ns: str, thread_id: str | None = None, user_id: str | None = None) -> dict[str, object]:
     tid = (thread_id or "").strip() or _ensure_thread_id()
+    uid = (user_id or "").strip() if isinstance(user_id, str) else ""
+    if not uid:
+        uid = _ensure_user_id()
     return {
         "recursion_limit": _recursion_limit(),
-        "configurable": {"thread_id": tid, "user_id": _ensure_user_id(), "checkpoint_ns": (checkpoint_ns or "").strip()},
+        "configurable": {"thread_id": tid, "user_id": uid, "checkpoint_ns": (checkpoint_ns or "").strip()},
     }
 
 

@@ -994,6 +994,16 @@ def run_cli(
         return "Empty command."
     if timeout_s <= 0:
         return "timeout_s must be > 0."
+    raw_cap = (os.environ.get("AGENT_RUN_CLI_TIMEOUT_S_MAX") or "").strip()
+    cap = 300
+    if raw_cap:
+        try:
+            cap = int(raw_cap)
+        except ValueError:
+            cap = 300
+    cap = max(5, min(3600, cap))
+    if timeout_s > cap:
+        timeout_s = cap
 
     project_root = Path(__file__).resolve().parent
     work_dir_env = os.environ.get("AGENT_WORK_DIR") or os.environ.get("AGENT_OUTPUT_DIR")
@@ -1578,7 +1588,7 @@ def identity_auth(username: str, password: str, ttl_s: int = 1800, runtime: Tool
         from memory.manager import verify_thread_auth, set_thread_identity
     except Exception as e:
         return f"Import failed: {e}"
-    ok, state = verify_thread_auth(tid, user=u, password=pw, ttl_s=ttl_s, extend=True)
+    ok, state = verify_thread_auth(tid, user=u, password=pw, ttl_s=ttl_s, extend=True, project_root=_memory_project_root())
     set_thread_identity(tid, confirmed=bool(ok))
     out = {"ok": bool(ok), "thread_id": tid}
     out.update(state if isinstance(state, dict) else {})
@@ -1618,16 +1628,7 @@ _IDENTITY_MEMORY_BLOCK_START = "<IDENTITY_AUTH>"
 _IDENTITY_MEMORY_BLOCK_END = "</IDENTITY_AUTH>"
 
 
-def _identity_memory_parse(text: str) -> dict[str, str]:
-    if not text:
-        return {}
-    start = text.find(_IDENTITY_MEMORY_BLOCK_START)
-    if start < 0:
-        return {}
-    end = text.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
-    if end < 0:
-        return {}
-    body = text[start + len(_IDENTITY_MEMORY_BLOCK_START) : end]
+def _identity_memory_parse_kv(body: str) -> dict[str, str]:
     out: dict[str, str] = {}
     for raw_line in (body or "").splitlines():
         line = (raw_line or "").strip()
@@ -1640,6 +1641,25 @@ def _identity_memory_parse(text: str) -> dict[str, str]:
         val = (v or "").strip()
         if key:
             out[key] = val
+    return out
+
+
+def _identity_memory_iter_blocks(text: str) -> list[tuple[int, int, dict[str, str]]]:
+    t = text or ""
+    out: list[tuple[int, int, dict[str, str]]] = []
+    pos = 0
+    while True:
+        start = t.find(_IDENTITY_MEMORY_BLOCK_START, pos)
+        if start < 0:
+            break
+        end = t.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
+        if end < 0:
+            break
+        end2 = end + len(_IDENTITY_MEMORY_BLOCK_END)
+        body = t[start + len(_IDENTITY_MEMORY_BLOCK_START) : end]
+        data = _identity_memory_parse_kv(body)
+        out.append((start, end2, data))
+        pos = end2
     return out
 
 
@@ -1658,22 +1678,27 @@ def _identity_memory_render(*, username: str, password: str, name: str, role: st
     return "\n".join(lines).strip()
 
 
-def _identity_memory_upsert(existing: str, block: str) -> str:
+def _identity_memory_upsert(existing: str, *, username: str, block: str) -> str:
     text = existing or ""
-    start = text.find(_IDENTITY_MEMORY_BLOCK_START)
-    if start >= 0:
-        end = text.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
-        if end >= 0:
-            end2 = end + len(_IDENTITY_MEMORY_BLOCK_END)
+    u = (username or "").strip()
+    if not u:
+        if text.strip():
+            return text.rstrip() + "\n\n" + block + "\n"
+        return block + "\n"
+
+    blocks = _identity_memory_iter_blocks(text)
+    for start, end2, data in blocks:
+        if (data.get("username") or "").strip() == u:
             before = text[:start].rstrip()
             after = text[end2:].lstrip()
-            parts = []
+            parts: list[str] = []
             if before:
                 parts.append(before)
             parts.append(block)
             if after:
                 parts.append(after)
             return "\n\n".join(parts).strip() + "\n"
+
     if text.strip():
         return text.rstrip() + "\n\n" + block + "\n"
     return block + "\n"
@@ -1701,7 +1726,7 @@ def identity_memory_set(
     try:
         existing = p.read_text(encoding="utf-8", errors="replace") if p.exists() else ""
         block = _identity_memory_render(username=u, password=pw, name=name, role=role, relation=relation)
-        new_text = _identity_memory_upsert(existing, block)
+        new_text = _identity_memory_upsert(existing, username=u, block=block)
         p.write_text(new_text, encoding="utf-8", errors="replace")
     except OSError as e:
         return f"Write failed: {e}"
@@ -1709,8 +1734,9 @@ def identity_memory_set(
 
 
 @tool
-def identity_memory_get() -> str:
+def identity_memory_get(username: str = "") -> str:
     """Read identity credentials from user memory markdown."""
+    want = (username or "").strip()
     try:
         from memory.paths import user_path
     except Exception as e:
@@ -1722,12 +1748,31 @@ def identity_memory_get() -> str:
         text = p.read_text(encoding="utf-8", errors="replace")
     except OSError as e:
         return f"Read failed: {e}"
-    data = _identity_memory_parse(text)
-    if not data:
+    blocks = _identity_memory_iter_blocks(text)
+    if not blocks:
         return json.dumps({"ok": True, "found": False}, ensure_ascii=False, sort_keys=True)
-    out: dict[str, object] = {"ok": True, "found": True}
-    out.update(data)
-    return json.dumps(out, ensure_ascii=False, sort_keys=True)
+    entries: list[dict[str, str]] = [d for _, _, d in blocks if isinstance(d, dict) and d]
+
+    if want:
+        for d in entries:
+            if (d.get("username") or "").strip() == want:
+                out: dict[str, object] = {"ok": True, "found": True}
+                out.update(d)
+                return json.dumps(out, ensure_ascii=False, sort_keys=True)
+        return json.dumps({"ok": True, "found": False}, ensure_ascii=False, sort_keys=True)
+
+    if len(entries) == 1:
+        out: dict[str, object] = {"ok": True, "found": True}
+        out.update(entries[0])
+        return json.dumps(out, ensure_ascii=False, sort_keys=True)
+
+    users: list[str] = []
+    for d in entries:
+        u = (d.get("username") or "").strip()
+        if u:
+            users.append(u)
+    users = sorted(set(users))
+    return json.dumps({"ok": True, "found": True, "count": len(users), "users": users}, ensure_ascii=False, sort_keys=True)
 
 
 
@@ -2002,6 +2047,51 @@ def _filter_text(text: str, tokens: list[str], *, max_lines: int = 220) -> str:
     return "\n".join(out).strip()
 
 
+def _default_session_view(items: dict[str, str], *, max_lines: int = 160) -> str:
+    if not items:
+        return ""
+    timeline_key = "时间线（Timeline）"
+    tl = (items.get(timeline_key) or "").strip()
+    if tl:
+        lines = [ln for ln in tl.splitlines() if ln.strip()]
+        lines = lines[:max_lines]
+        body = "\n".join(lines).strip()
+        return f"## {timeline_key}\n{body}".strip() if body else f"## {timeline_key}"
+
+    keys = [k for k in items.keys() if (k or "").strip() and k != timeline_key]
+    out_lines: list[str] = []
+    used = 0
+    for k in sorted(keys):
+        body = (items.get(k) or "").strip()
+        if not body:
+            continue
+        if used >= max_lines:
+            break
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        lines = lines[: min(16, max_lines - used)]
+        if not lines:
+            continue
+        out_lines.append(f"## {k}")
+        out_lines.extend(lines)
+        out_lines.append("")
+        used += len(lines)
+    while out_lines and not out_lines[-1].strip():
+        out_lines.pop()
+    return "\n".join(out_lines).strip()
+
+
+def _is_continue_like_question(q: str) -> bool:
+    s = (q or "").strip()
+    if not s:
+        return False
+    s2 = s.replace(" ", "")
+    if s2 in {"继续", "接着", "继续吧", "接着说", "继续说"}:
+        return True
+    if any(x in s2 for x in ["继续", "接着", "刚才", "刚刚", "上面", "前面", "上一条", "上一次"]):
+        return len(s2) <= 18
+    return False
+
+
 @tool
 def memory_session_query(question: str, date: str = "") -> str:
     """Query session memories by natural language question (auto date + scene/keyword)."""
@@ -2030,6 +2120,7 @@ def memory_session_query(question: str, date: str = "") -> str:
             if filtered:
                 return filtered
     if not kw:
+        tail_lines = 50 if _is_continue_like_question(q) else 0
         if ds.lower() in {"all", "*"}:
             today = datetime.now().date()
             start = today - timedelta(days=6)
@@ -2053,9 +2144,16 @@ def memory_session_query(question: str, date: str = "") -> str:
                     out_lines.append("")
                 out_lines.append(f"# {d}")
                 out_lines.append("")
-            for k in sorted(items.keys()):
-                body = (items.get(k) or "").strip()
-                out_lines.append(f"## {k}\n{body}".strip() if body else f"## {k}")
+            if tail_lines and (items.get("时间线（Timeline）") or "").strip():
+                tl = (items.get("时间线（Timeline）") or "").strip()
+                lines = [ln for ln in tl.splitlines() if ln.strip()]
+                lines = lines[-tail_lines:]
+                body = "\n".join(lines).strip()
+                view = f"## 时间线（Timeline）\n{body}".strip() if body else "## 时间线（Timeline）"
+            else:
+                view = _default_session_view(items)
+            if view:
+                out_lines.append(view)
                 out_lines.append("")
         while out_lines and not out_lines[-1].strip():
             out_lines.pop()
@@ -2248,6 +2346,17 @@ def _runtime_thread_id(runtime: ToolRuntime) -> str:
     return (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
 
 
+def _runtime_user_id(runtime: ToolRuntime) -> str:
+    cfg = getattr(runtime, "config", None) or {}
+    if isinstance(cfg, dict):
+        configurable = cfg.get("configurable") or {}
+        if isinstance(configurable, dict):
+            uid = (configurable.get("user_id") or "").strip()
+            if uid:
+                return uid
+    return (os.environ.get("AGENT_USER_ID") or "").strip() or "default"
+
+
 def _parse_namespace(namespace: str, *, default: tuple[str, ...] = ("default",)) -> tuple[str, ...]:
     raw = (namespace or "").strip()
     if not raw:
@@ -2277,8 +2386,24 @@ def _parse_run_ts(run_at: str) -> float | None:
         return None
 
 
+def _guess_reminder_mode(message: str) -> str:
+    msg = (message or "").strip()
+    if not msg:
+        return "remind"
+    for kw in ("提醒", "提醒我", "提醒一下", "别忘", "记得"):
+        if kw in msg:
+            return "remind"
+    return "execute"
+
+
+def _format_run_at_display(ts: float) -> tuple[str, str]:
+    dt = datetime.fromtimestamp(float(ts)).astimezone()
+    return dt.isoformat(sep=" ", timespec="seconds"), dt.strftime("%H:%M:%S")
+
+
+
 @tool
-def reminder_schedule_at(message: str, run_at: str, reminder_id: str = "") -> str:
+def reminder_schedule_at(message: str, run_at: str, reminder_id: str = "", runtime: ToolRuntime = None) -> str:
     """Schedule a one-shot reminder at a specific time (ISO string or unix seconds)."""
     from system.manager import get_global_system_manager
 
@@ -2288,16 +2413,28 @@ def reminder_schedule_at(message: str, run_at: str, reminder_id: str = "") -> st
     ts = _parse_run_ts(run_at)
     if ts is None:
         return "Invalid run_at. Use ISO datetime (e.g. 2026-02-10T18:00:00) or unix seconds."
+    tid = _runtime_thread_id(runtime) if runtime is not None else (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
+    uid = _runtime_user_id(runtime) if runtime is not None else (os.environ.get("AGENT_USER_ID") or "").strip() or "default"
     try:
-        rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id)
+        rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id, user_id=uid, thread_id=tid)
     except Exception as e:
         return f"Failed: {type(e).__name__}: {e}"
-    run_at_out = datetime.fromtimestamp(float(ts)).astimezone().isoformat(sep=" ", timespec="seconds")
-    return json.dumps({"ok": True, "id": rid, "run_at": run_at_out}, ensure_ascii=False, sort_keys=True)
+    run_at_out, run_at_time = _format_run_at_display(ts)
+    mode = _guess_reminder_mode(message)
+    msg = (message or "").strip()
+    if mode == "execute":
+        user_notice = f"已设置定时任务，将在 {run_at_out}（{run_at_time}）自动执行：{msg}。任务ID：{rid}。"
+    else:
+        user_notice = f"已设置提醒，将在 {run_at_out}（{run_at_time}）提醒你：{msg}。提醒ID：{rid}。"
+    return json.dumps(
+        {"ok": True, "id": rid, "run_at": run_at_out, "mode": mode, "user_notice": user_notice},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
 
 
 @tool
-def reminder_schedule_in(message: str, delay_s: int = 60, reminder_id: str = "") -> str:
+def reminder_schedule_in(message: str, delay_s: int = 60, reminder_id: str = "", runtime: ToolRuntime = None) -> str:
     """Schedule a one-shot reminder after delay seconds."""
     from system.manager import get_global_system_manager
 
@@ -2311,32 +2448,42 @@ def reminder_schedule_in(message: str, delay_s: int = 60, reminder_id: str = "")
     if s <= 0:
         return "Invalid delay_s. Must be > 0."
     ts = time.time() + s
+    tid = _runtime_thread_id(runtime) if runtime is not None else (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default"
+    uid = _runtime_user_id(runtime) if runtime is not None else (os.environ.get("AGENT_USER_ID") or "").strip() or "default"
     try:
-        rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id)
+        rid = mgr.reminder_create_at(run_ts=ts, message=message, reminder_id=reminder_id, user_id=uid, thread_id=tid)
     except Exception as e:
         return f"Failed: {type(e).__name__}: {e}"
-    run_at_out = datetime.fromtimestamp(float(ts)).astimezone().isoformat(sep=" ", timespec="seconds")
+    run_at_out, run_at_time = _format_run_at_display(ts)
+    mode = _guess_reminder_mode(message)
+    msg = (message or "").strip()
+    s2 = int(s)
+    if mode == "execute":
+        user_notice = f"已设置定时任务，将在 {s2} 秒后（{run_at_time}）自动执行：{msg}。任务ID：{rid}。"
+    else:
+        user_notice = f"已设置提醒，将在 {s2} 秒后（{run_at_time}）提醒你：{msg}。提醒ID：{rid}。"
     return json.dumps(
-        {"ok": True, "id": rid, "run_at": run_at_out, "delay_s": int(s)},
+        {"ok": True, "id": rid, "run_at": run_at_out, "delay_s": s2, "mode": mode, "user_notice": user_notice},
         ensure_ascii=False,
         sort_keys=True,
     )
 
 
 @tool
-def reminder_cancel(reminder_id: str) -> str:
+def reminder_cancel(reminder_id: str, runtime: ToolRuntime = None) -> str:
     """Cancel a scheduled reminder by id."""
     from system.manager import get_global_system_manager
 
     mgr = get_global_system_manager()
     if mgr is None:
         return "SystemManager is not available."
-    ok = bool(mgr.reminder_cancel(reminder_id))
+    uid = _runtime_user_id(runtime) if runtime is not None else (os.environ.get("AGENT_USER_ID") or "").strip() or ""
+    ok = bool(mgr.reminder_cancel(reminder_id, user_id=uid))
     return json.dumps({"ok": ok, "id": (reminder_id or "").strip()}, ensure_ascii=False, sort_keys=True)
 
 
 @tool
-def reminder_list(status: str = "") -> str:
+def reminder_list(status: str = "", runtime: ToolRuntime = None) -> str:
     """List reminders recorded in the system."""
     from system.manager import get_global_system_manager
 
@@ -2344,6 +2491,9 @@ def reminder_list(status: str = "") -> str:
     if mgr is None:
         return "SystemManager is not available."
     items = mgr.reminder_list()
+    uid = _runtime_user_id(runtime) if runtime is not None else (os.environ.get("AGENT_USER_ID") or "").strip()
+    if uid:
+        items = [it for it in items if (it.get("user_id") or "") == uid]
     st = (status or "").strip().lower()
     if st:
         items = [it for it in items if str(it.get("status") or "").lower() == st]

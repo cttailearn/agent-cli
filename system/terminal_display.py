@@ -14,7 +14,7 @@ from langchain_core.messages import (
     ToolMessageChunk,
 )
 
-from agents import console_write
+from agents import console_print, console_write
 from agents.runtime import (
     capture_token_usage_from_message,
     estimate_token_usage,
@@ -102,9 +102,9 @@ def _summarize_actions(actions: list[dict[str, object]]) -> str:
 
 def _print_block(title: str, text: str) -> None:
     if title:
-        print(title)
+        console_print(title, ensure_newline=True)
     if text:
-        print(text)
+        console_print(text, ensure_newline=True)
 
 
 def _summarize_tool_output_for_terminal(raw: str) -> str:
@@ -137,35 +137,35 @@ def _print_last(state: CliState, kind: str) -> None:
 
     if kind in {"actions", "action"}:
         if not state.last_actions:
-            print("暂无最近执行记录。")
+            console_print("暂无最近执行记录。", ensure_newline=True)
             return
         summary = _summarize_actions(state.last_actions)
         if summary:
-            print(summary)
+            console_print(summary, ensure_newline=True)
         _print_block("", _format_actions(state.last_actions))
         return
 
     if kind in {"tools", "tool"}:
         if not state.last_tool_output:
-            print("暂无最近工具输出。")
+            console_print("暂无最近工具输出。", ensure_newline=True)
             return
         summarized = _summarize_tool_output_for_terminal(state.last_tool_output)
         if not summarized:
-            print("（无可展示的摘要）")
+            console_print("（无可展示的摘要）", ensure_newline=True)
             return
         _print_block("", summarized)
         if state.last_tool_output_truncated:
-            print("（已截断存储）")
+            console_print("（已截断存储）", ensure_newline=True)
         return
 
     if kind == "skills":
         if not state.skill_catalog_text:
-            print("暂无技能目录。")
+            console_print("暂无技能目录。", ensure_newline=True)
             return
         _print_block(f"技能目录（共 {state.skill_count} 个）", state.skill_catalog_text)
         return
 
-    print("用法：/last [actions|tools|skills|all]")
+    console_print("用法：/last [actions|tools|skills|all]", ensure_newline=True)
 
 
 def stream_assistant_reply(agent, messages: list[dict[str, object]], state: CliState) -> str:
@@ -278,6 +278,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, object]], state: CliS
                     "recursion_limit": _recursion_limit(),
                     "configurable": {
                         "thread_id": (os.environ.get("AGENT_THREAD_ID") or "").strip() or "default",
+                        "user_id": (os.environ.get("AGENT_USER_ID") or "").strip() or "default",
                         "checkpoint_ns": "observer",
                     },
                 },
@@ -359,7 +360,7 @@ def stream_assistant_reply(agent, messages: list[dict[str, object]], state: CliS
         state.last_tool_output_truncated = False
 
     if _COMPLETION_CLAIM_RE.search(reply) and not actions:
-        print("本轮未执行任何工具调用，因此未产生可验证的文件/命令执行结果。", flush=True)
+        console_print("本轮未执行任何工具调用，因此未产生可验证的文件/命令执行结果。", ensure_newline=True, flush=True)
 
     return reply
 
@@ -376,10 +377,10 @@ def handle_local_command(
     if user_text.startswith("!"):
         cmd = user_text[1:].strip()
         if not cmd:
-            print("用法：!<命令>")
+            console_print("用法：!<命令>", ensure_newline=True)
             return "continue"
-        print(f"! {cmd}")
-        print(run_cli.invoke({"command": cmd, "stream": False}))
+        console_print(f"! {cmd}", ensure_newline=True)
+        console_print(run_cli.invoke({"command": cmd, "stream": False}), ensure_newline=True)
         return "continue"
 
     if not user_text.startswith("/"):
@@ -396,11 +397,11 @@ def handle_local_command(
         messages.clear()
         history.clear()
         os.environ["AGENT_THREAD_ID"] = uuid.uuid4().hex[:12]
-        print("已重置对话与历史。")
+        console_print("已重置对话与历史。", ensure_newline=True)
         return "continue"
 
     if cmd in {"help", "h", "?"}:
-        print(
+        console_print(
             "\n".join(
                 [
                     "内置命令：",
@@ -430,44 +431,44 @@ def handle_local_command(
 
     if cmd in {"ls", "dir"}:
         path = args[0] if args else "."
-        print(f"ls {path}")
-        print(list_dir.invoke({"path": path, "recursive": False}))
+        console_print(f"ls {path}", ensure_newline=True)
+        console_print(list_dir.invoke({"path": path, "recursive": False}), ensure_newline=True)
         return "continue"
 
     if cmd in {"lsr", "tree"}:
         path = args[0] if args else "."
-        print(f"lsr {path}")
-        print(list_dir.invoke({"path": path, "recursive": True}))
+        console_print(f"lsr {path}", ensure_newline=True)
+        console_print(list_dir.invoke({"path": path, "recursive": True}), ensure_newline=True)
         return "continue"
 
     if cmd in {"cat", "type"}:
         if not args:
-            print("用法：/cat <path>")
+            console_print("用法：/cat <path>", ensure_newline=True)
             return "continue"
-        print(f"cat {args[0]}")
+        console_print(f"cat {args[0]}", ensure_newline=True)
         return "continue"
 
     if cmd == "rm":
         if not args:
-            print("用法：/rm <path>")
+            console_print("用法：/rm <path>", ensure_newline=True)
             return "continue"
-        print(f"rm {args[0]}")
-        print(delete_path.invoke({"path": args[0], "recursive": False}))
+        console_print(f"rm {args[0]}", ensure_newline=True)
+        console_print(delete_path.invoke({"path": args[0], "recursive": False}), ensure_newline=True)
         return "continue"
 
     if cmd == "rmr":
         if not args:
-            print("用法：/rmr <path>")
+            console_print("用法：/rmr <path>", ensure_newline=True)
             return "continue"
-        print(f"rmr {args[0]}")
-        print(delete_path.invoke({"path": args[0], "recursive": True}))
+        console_print(f"rmr {args[0]}", ensure_newline=True)
+        console_print(delete_path.invoke({"path": args[0], "recursive": True}), ensure_newline=True)
         return "continue"
 
     if cmd in {"pwd", "cwd"}:
         project_root = Path(os.environ.get("AGENT_PROJECT_DIR", ".")).resolve()
         output_dir = Path(os.environ.get("AGENT_OUTPUT_DIR", ".")).resolve()
         work_dir = Path(os.environ.get("AGENT_WORK_DIR", ".")).resolve()
-        print(
+        console_print(
             "\n".join(
                 [
                     f"cwd: {Path.cwd().resolve().as_posix()}",
@@ -481,7 +482,7 @@ def handle_local_command(
 
     if cmd == "cd":
         if not args:
-            print("用法：/cd <path>")
+            console_print("用法：/cd <path>", ensure_newline=True)
             return "continue"
         project_root = Path(os.environ.get("AGENT_PROJECT_DIR", ".")).resolve()
         target = Path(args[0])
@@ -490,19 +491,19 @@ def handle_local_command(
         try:
             resolved = target.resolve()
         except OSError as e:
-            print(f"无效路径：{args[0]}（{e}）")
+            console_print(f"无效路径：{args[0]}（{e}）", ensure_newline=True)
             return "continue"
         try:
             resolved.relative_to(project_root)
         except ValueError:
-            print(f"拒绝切换到项目目录之外：{resolved.as_posix()}")
+            console_print(f"拒绝切换到项目目录之外：{resolved.as_posix()}", ensure_newline=True)
             return "continue"
         if not resolved.exists() or not resolved.is_dir():
-            print(f"不是目录：{resolved.as_posix()}")
+            console_print(f"不是目录：{resolved.as_posix()}", ensure_newline=True)
             return "continue"
         os.environ["AGENT_WORK_DIR"] = str(resolved)
         os.chdir(resolved)
-        print(f"cd {resolved.as_posix()}")
+        console_print(f"cd {resolved.as_posix()}", ensure_newline=True)
         return "continue"
 
     if cmd in {"clear", "cls"}:
@@ -515,17 +516,17 @@ def handle_local_command(
             try:
                 n = max(1, int(args[0]))
             except ValueError:
-                print("用法：/history [n]")
+                console_print("用法：/history [n]", ensure_newline=True)
                 return "continue"
         for i, item in enumerate(history[-n:], start=max(1, len(history) - n + 1)):
-            print(f"{i}. {item}")
+            console_print(f"{i}. {item}", ensure_newline=True)
         return "continue"
 
     if cmd in {"tools", "t"}:
         project_root = Path(os.environ.get("AGENT_PROJECT_DIR", ".")).resolve()
         output_dir = Path(os.environ.get("AGENT_OUTPUT_DIR", ".")).resolve()
         work_dir = Path(os.environ.get("AGENT_WORK_DIR", ".")).resolve()
-        print(
+        console_print(
             "\n".join(
                 [
                     "可用工具（供智能体调用）：",
@@ -574,16 +575,16 @@ def handle_local_command(
                 for k, m in items:
                     mark = "*" if k == active_key else " "
                     lines.append(f"{mark} {k} -> {m or '(missing model)'}")
-            print("\n".join(lines))
+            console_print("\n".join(lines), ensure_newline=True)
             return "continue"
         target = args[0].strip()
         if not target:
-            print("用法：/models [list|<name>]")
+            console_print("用法：/models [list|<name>]", ensure_newline=True)
             return "continue"
         cfg2 = set_active_model(p, target)
         apply_config_to_environ(cfg2, override=True)
-        print(f"已切换模型：{target} -> {os.environ.get('LC_MODEL', '').strip()}")
-        print("正在重建运行时（切换模型），请稍候...", flush=True)
+        console_print(f"已切换模型：{target} -> {os.environ.get('LC_MODEL', '').strip()}", ensure_newline=True)
+        console_print("正在重建运行时（切换模型），请稍候...", ensure_newline=True, flush=True)
         return "rebuild"
 
     if cmd in {"ws", "workspace"}:
@@ -608,7 +609,7 @@ def handle_local_command(
                             lines.append("...(truncated)")
             except Exception:
                 pass
-            print("\n".join(lines))
+            console_print("\n".join(lines), ensure_newline=True)
             return "continue"
         target = _sanitize_ws(args[0])
         cfg2 = set_active_workspace(p, target)
@@ -618,13 +619,13 @@ def handle_local_command(
             os.environ["AGENT_OUTPUT_DIR"] = str((base_dir / target).resolve())
         except Exception:
             os.environ["AGENT_OUTPUT_DIR"] = str(base_dir / target)
-        print(f"已切换输出工作空间：{target}")
-        print("正在重建运行时（切换输出工作空间），请稍候...", flush=True)
+        console_print(f"已切换输出工作空间：{target}", ensure_newline=True)
+        console_print("正在重建运行时（切换输出工作空间），请稍候...", ensure_newline=True, flush=True)
         return "rebuild"
 
     if cmd in {"skills"}:
         if not state.skill_catalog_text:
-            print("暂无技能目录。")
+            console_print("暂无技能目录。", ensure_newline=True)
             return "continue"
         _print_block(f"技能目录（共 {state.skill_count} 个）", state.skill_catalog_text)
         return "continue"
@@ -636,11 +637,11 @@ def handle_local_command(
 
     if cmd in {"verbose", "v"}:
         if not args or args[0].lower() not in {"on", "off"}:
-            print("用法：/verbose <on|off>")
+            console_print("用法：/verbose <on|off>", ensure_newline=True)
             return "continue"
         state.show_tool_output = args[0].lower() == "on"
-        print(f"工具输出直显已{'开启' if state.show_tool_output else '关闭'}。")
+        console_print(f"工具输出直显已{'开启' if state.show_tool_output else '关闭'}。", ensure_newline=True)
         return "continue"
 
-    print("未知命令，输入 /help 查看。")
+    console_print("未知命令，输入 /help 查看。", ensure_newline=True)
     return "continue"

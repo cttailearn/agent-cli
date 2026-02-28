@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import fnmatch
 import os
 import re
@@ -8,6 +9,7 @@ import shlex
 import signal
 import subprocess
 import shutil
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -320,17 +322,14 @@ def _kill_process_tree(pid: int) -> None:
         return
     if os.name == "nt":
         try:
-            asyncio.create_task(
-                asyncio.to_thread(
-                    subprocess.run,
-                    ["taskkill", "/PID", str(pid), "/T", "/F"],
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=10,
-                    check=False,
-                )
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=10,
+                check=False,
             )
         except Exception:
             pass
@@ -455,22 +454,217 @@ class ExecSession:
 
 class SessionRegistry:
     def __init__(self) -> None:
+        self._lock = threading.RLock()
         self._sessions: Dict[str, ExecSession] = {}
 
     def add(self, session: ExecSession) -> None:
-        self._sessions[session.session_id] = session
+        with self._lock:
+            self._sessions[session.session_id] = session
 
     def get(self, session_id: str) -> Optional[ExecSession]:
-        return self._sessions.get(session_id)
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def remove(self, session_id: str) -> None:
-        self._sessions.pop(session_id, None)
+        with self._lock:
+            self._sessions.pop(session_id, None)
 
     def clear(self) -> None:
-        self._sessions.clear()
+        with self._lock:
+            self._sessions.clear()
 
     def list(self) -> List[ExecSession]:
-        return sorted(self._sessions.values(), key=lambda s: s.started_at, reverse=True)
+        with self._lock:
+            return sorted(self._sessions.values(), key=lambda s: s.started_at, reverse=True)
+
+
+class ExecEngine:
+    def __init__(self, registry: SessionRegistry) -> None:
+        self._registry = registry
+        self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=5)
+
+    def _run_loop(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._ready.set()
+        self._loop.run_forever()
+        try:
+            pending = asyncio.all_tasks(self._loop)
+        except Exception:
+            pending = set()
+        if pending:
+            for t in pending:
+                t.cancel()
+            try:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+        try:
+            self._loop.run_until_complete(self._loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        self._loop.close()
+
+    def submit(self, coro: asyncio.Future) -> concurrent.futures.Future:
+        return asyncio.run_coroutine_threadsafe(coro, self._loop)
+
+    def run(self, coro: asyncio.Future, *, timeout_s: float | None = None) -> Any:
+        fut = self.submit(coro)
+        return fut.result(timeout=timeout_s)
+
+    async def run_async(self, coro: asyncio.Future) -> Any:
+        fut = self.submit(coro)
+        return await asyncio.wrap_future(fut)
+
+    async def exec_session(
+        self,
+        *,
+        command: str,
+        cwd: str,
+        env: Dict[str, str],
+        yield_ms: int,
+        background: bool,
+        timeout_sec: int,
+        stdin_data: str | None,
+        stdin_eof: bool,
+        interactive: bool,
+    ) -> dict[str, object]:
+        started_at = time.time()
+        proc = await asyncio.create_subprocess_shell(
+            command,
+            cwd=cwd,
+            env=env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=(os.name != "nt"),
+        )
+
+        session_id = uuid.uuid4().hex[:12]
+        session = ExecSession(
+            session_id=session_id,
+            command=command,
+            cwd=cwd,
+            started_at=started_at,
+            process=proc,
+        )
+        self._registry.add(session)
+
+        if proc.stdin is not None:
+            if stdin_data is not None:
+                proc.stdin.write(stdin_data.encode())
+                await proc.stdin.drain()
+            if stdin_eof or not interactive:
+                proc.stdin.close()
+
+        async def pump(stream: Optional[asyncio.StreamReader]) -> None:
+            if stream is None:
+                return
+            while True:
+                chunk = await stream.read(4096)
+                if not chunk:
+                    break
+                session.append_output(chunk.decode(errors="replace"))
+
+        stdout_task = asyncio.create_task(pump(proc.stdout))
+        stderr_task = asyncio.create_task(pump(proc.stderr))
+
+        async def wait_and_finalize() -> None:
+            try:
+                try:
+                    await asyncio.wait_for(proc.wait(), timeout=float(max(1, int(timeout_sec))))
+                except asyncio.TimeoutError:
+                    await asyncio.to_thread(_kill_process_tree, int(proc.pid or 0))
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except Exception:
+                        pass
+                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            finally:
+                session.exited = True
+                session.exit_code = proc.returncode
+
+        finalize_task = asyncio.create_task(wait_and_finalize())
+
+        if background:
+            session.backgrounded = True
+            return {
+                "status": "running",
+                "session_id": session.session_id,
+                "pid": proc.pid,
+                "started_at": session.started_at,
+                "cwd": session.cwd,
+                "tail": session.tail,
+            }
+
+        done, _ = await asyncio.wait({finalize_task}, timeout=max(0.1, int(yield_ms)) / 1000.0)
+        if finalize_task in done:
+            exit_code = session.exit_code
+            ok = exit_code == 0
+            return {
+                "status": "completed" if ok else "failed",
+                "exit_code": exit_code,
+                "duration_ms": int((time.time() - started_at) * 1000),
+                "aggregated": session.aggregated or "",
+                "cwd": session.cwd,
+            }
+
+        session.backgrounded = True
+        return {
+            "status": "running",
+            "session_id": session.session_id,
+            "pid": proc.pid,
+            "started_at": session.started_at,
+            "cwd": session.cwd,
+            "tail": session.tail,
+        }
+
+    async def write_session(self, *, session_id: str, data: str, newline: bool, eof: bool) -> dict[str, object]:
+        s = self._registry.get(session_id)
+        if not s:
+            return {"status": "failed", "reason": "session not found"}
+        if s.exited:
+            return {"status": "failed", "reason": "process exited", "session_id": s.session_id, "exit_code": s.exit_code}
+        if s.process.stdin is None or s.process.stdin.is_closing():
+            return {"status": "failed", "reason": "stdin unavailable", "session_id": s.session_id}
+        payload = data or ""
+        if newline and not payload.endswith("\n"):
+            payload += "\n"
+        try:
+            s.process.stdin.write(payload.encode())
+            await s.process.stdin.drain()
+            if eof:
+                s.process.stdin.close()
+            return {"status": "completed", "session_id": s.session_id}
+        except Exception:
+            return {"status": "failed", "reason": "stdin write failed", "session_id": s.session_id}
+
+    async def kill_session(self, *, session_id: str) -> dict[str, object]:
+        s = self._registry.get(session_id)
+        if not s:
+            return {"status": "failed", "reason": "session not found"}
+        if not s.exited:
+            try:
+                await asyncio.to_thread(_kill_process_tree, int(s.process.pid or 0))
+            except Exception:
+                pass
+            try:
+                await asyncio.wait_for(s.process.wait(), timeout=5)
+            except Exception:
+                try:
+                    s.process.kill()
+                except Exception:
+                    pass
+                try:
+                    await asyncio.wait_for(s.process.wait(), timeout=5)
+                except Exception:
+                    pass
+            s.exited = True
+            s.exit_code = s.process.returncode
+        return {"status": "completed", "session_id": s.session_id, "exit_code": s.exit_code}
 
 
 class ExecInput(BaseModel):
@@ -498,6 +692,38 @@ class ProcessInput(BaseModel):
     eof: Optional[bool] = None
 
 
+def _int_env(name: str, default: int, *, min_v: int, max_v: int) -> int:
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return max(min_v, min(max_v, int(default)))
+    try:
+        v = int(raw)
+    except ValueError:
+        v = int(default)
+    return max(min_v, min(max_v, v))
+
+
+def _clamp_int(value: int | None, default: int, *, min_v: int, max_v: int) -> int:
+    try:
+        v = int(value) if value is not None else int(default)
+    except Exception:
+        v = int(default)
+    return max(min_v, min(max_v, v))
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedExec:
+    command: str
+    cwd: str
+    env: Dict[str, str]
+    yield_ms: int
+    background: bool
+    timeout_sec: int
+    stdin_data: str | None
+    stdin_eof: bool
+    interactive: bool
+
+
 class ExecTool(BaseTool):
     name: str = "exec"
     description: str = (
@@ -508,6 +734,7 @@ class ExecTool(BaseTool):
 
     def __init__(
         self,
+        engine: ExecEngine,
         registry: SessionRegistry,
         *,
         allowlist: Optional[List[str]] = None,
@@ -517,13 +744,14 @@ class ExecTool(BaseTool):
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        self._engine = engine
         self._registry = registry
         self._allowlist = allowlist or []
         self._safe_bins = safe_bins or []
         self._forbid_path_override = forbid_path_override
         self._approval_callback = approval_callback
 
-    async def _arun(self, command: str, **kwargs: Any) -> Any:
+    def _prepare(self, command: str, **kwargs: Any) -> PreparedExec | dict[str, object]:
         params = ExecInput(command=command, **kwargs)
         if not params.command.strip():
             raise ValueError("command required")
@@ -543,6 +771,7 @@ class ExecTool(BaseTool):
             cwd_path = cwd_path.resolve()
         except OSError:
             cwd_path = work_root
+
         extra_roots: list[Path] = []
         raw_extra = (os.environ.get("AGENT_EXTRA_CWD_ROOTS") or "").strip()
         if raw_extra:
@@ -576,9 +805,7 @@ class ExecTool(BaseTool):
         if security == "deny":
             return {"status": "denied", "reason": "security=deny"}
 
-        analysis_ok, allowlist_satisfied = _evaluate_allowlist(
-            params.command, cwd, self._allowlist, self._safe_bins
-        )
+        analysis_ok, allowlist_satisfied = _evaluate_allowlist(params.command, cwd, self._allowlist, self._safe_bins)
         if security == "allowlist" and analysis_ok and not allowlist_satisfied:
             if not _requires_approval(ask, security, analysis_ok, allowlist_satisfied):
                 return {"status": "denied", "reason": "allowlist_miss"}
@@ -587,108 +814,65 @@ class ExecTool(BaseTool):
             decision = self._approval_callback(params.command) if self._approval_callback else None
             if decision == "deny" or decision is None:
                 approval_id = str(uuid.uuid4())
-                return {
-                    "status": "approval_required",
-                    "approval_id": approval_id,
-                    "command": params.command,
-                    "cwd": cwd,
-                }
+                return {"status": "approval_required", "approval_id": approval_id, "command": params.command, "cwd": cwd}
 
-        started_at = time.time()
-        proc = await asyncio.create_subprocess_shell(
-            params.command,
-            cwd=cwd,
-            env=env,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=(os.name != "nt"),
-        )
+        timeout_max = _int_env("AGENT_EXEC_TIMEOUT_SEC_MAX", 3600, min_v=10, max_v=86_400)
+        timeout_default = _int_env("AGENT_EXEC_TIMEOUT_SEC", 1800, min_v=10, max_v=timeout_max)
+        timeout_sec = _clamp_int(params.timeout_sec, timeout_default, min_v=10, max_v=timeout_max)
 
-        session_id = uuid.uuid4().hex[:12]
-        session = ExecSession(
-            session_id=session_id,
+        yield_max = _int_env("AGENT_EXEC_YIELD_MS_MAX", 30_000, min_v=500, max_v=120_000)
+        yield_default = _int_env("AGENT_EXEC_YIELD_MS", 10_000, min_v=500, max_v=yield_max)
+        yield_ms = _clamp_int(params.yield_ms, yield_default, min_v=500, max_v=yield_max)
+
+        return PreparedExec(
             command=params.command,
             cwd=cwd,
-            started_at=started_at,
-            process=proc,
+            env=env,
+            yield_ms=yield_ms,
+            background=bool(params.background),
+            timeout_sec=timeout_sec,
+            stdin_data=params.stdin_data,
+            stdin_eof=bool(params.stdin_eof),
+            interactive=bool(params.interactive),
         )
-        self._registry.add(session)
 
-        if proc.stdin is not None:
-            if params.stdin_data is not None:
-                proc.stdin.write(params.stdin_data.encode())
-                await proc.stdin.drain()
-            if params.stdin_eof or not (params.interactive or False):
-                proc.stdin.close()
-
-        async def pump(stream: Optional[asyncio.StreamReader], sink: Callable[[str], None]) -> None:
-            if stream is None:
-                return
-            while True:
-                chunk = await stream.read(4096)
-                if not chunk:
-                    break
-                text = chunk.decode(errors="replace")
-                sink(text)
-
-        stdout_task = asyncio.create_task(pump(proc.stdout, session.append_output))
-        stderr_task = asyncio.create_task(pump(proc.stderr, session.append_output))
-
-        async def wait_and_finalize() -> None:
-            try:
-                try:
-                    await asyncio.wait_for(proc.wait(), timeout=float(params.timeout_sec or 0))
-                except asyncio.TimeoutError:
-                    _kill_process_tree(int(proc.pid or 0))
-                    try:
-                        await asyncio.wait_for(proc.wait(), timeout=5)
-                    except Exception:
-                        pass
-                await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
-            finally:
-                session.exited = True
-                session.exit_code = proc.returncode
-
-        finalize_task = asyncio.create_task(wait_and_finalize())
-
-        if params.background:
-            session.backgrounded = True
-            return {
-                "status": "running",
-                "session_id": session.session_id,
-                "pid": proc.pid,
-                "started_at": session.started_at,
-                "cwd": session.cwd,
-                "tail": session.tail,
-            }
-
-        yield_ms = int(params.yield_ms or 10_000)
-        done, _ = await asyncio.wait({finalize_task}, timeout=yield_ms / 1000.0)
-
-        if finalize_task in done:
-            exit_code = session.exit_code
-            ok = exit_code == 0
-            return {
-                "status": "completed" if ok else "failed",
-                "exit_code": exit_code,
-                "duration_ms": int((time.time() - started_at) * 1000),
-                "aggregated": session.aggregated or "",
-                "cwd": session.cwd,
-            }
-
-        session.backgrounded = True
-        return {
-            "status": "running",
-            "session_id": session.session_id,
-            "pid": proc.pid,
-            "started_at": session.started_at,
-            "cwd": session.cwd,
-            "tail": session.tail,
-        }
+    async def _arun(self, command: str, **kwargs: Any) -> Any:
+        prepared = self._prepare(command, **kwargs)
+        if isinstance(prepared, dict):
+            return prepared
+        return await self._engine.run_async(
+            self._engine.exec_session(
+                command=prepared.command,
+                cwd=prepared.cwd,
+                env=prepared.env,
+                yield_ms=prepared.yield_ms,
+                background=prepared.background,
+                timeout_sec=prepared.timeout_sec,
+                stdin_data=prepared.stdin_data,
+                stdin_eof=prepared.stdin_eof,
+                interactive=prepared.interactive,
+            )
+        )
 
     def _run(self, command: str, **kwargs: Any) -> Any:
-        return asyncio.run(self._arun(command, **kwargs))
+        prepared = self._prepare(command, **kwargs)
+        if isinstance(prepared, dict):
+            return prepared
+        timeout_s = float(int(prepared.yield_ms) / 1000.0 + 15.0)
+        return self._engine.run(
+            self._engine.exec_session(
+                command=prepared.command,
+                cwd=prepared.cwd,
+                env=prepared.env,
+                yield_ms=prepared.yield_ms,
+                background=prepared.background,
+                timeout_sec=prepared.timeout_sec,
+                stdin_data=prepared.stdin_data,
+                stdin_eof=prepared.stdin_eof,
+                interactive=prepared.interactive,
+            ),
+            timeout_s=timeout_s,
+        )
 
 
 class ProcessTool(BaseTool):
@@ -696,8 +880,9 @@ class ProcessTool(BaseTool):
     description: str = "Manage running exec sessions: list, poll, log, write, kill, remove, clear."
     args_schema: type[BaseModel] = ProcessInput
 
-    def __init__(self, registry: SessionRegistry, **kwargs: Any) -> None:
+    def __init__(self, engine: ExecEngine, registry: SessionRegistry, **kwargs: Any) -> None:
         super().__init__(**kwargs)
+        self._engine = engine
         self._registry = registry
 
     async def _arun(self, action: str, **kwargs: Any) -> Any:
@@ -748,28 +933,17 @@ class ProcessTool(BaseTool):
             return {"status": "completed", "session_id": s.session_id, "text": sliced}
 
         if params.action == "write":
-            if s.process.stdin is None or s.process.stdin.is_closing():
-                return {"status": "failed", "reason": "stdin unavailable"}
-            data = params.data or ""
-            if params.newline:
-                if not data.endswith("\n"):
-                    data += "\n"
-            try:
-                s.process.stdin.write(data.encode())
-                await s.process.stdin.drain()
-                if params.eof:
-                    s.process.stdin.close()
-                return {"status": "completed", "session_id": s.session_id}
-            except Exception:
-                return {"status": "failed", "reason": "stdin write failed", "session_id": s.session_id}
+            return await self._engine.run_async(
+                self._engine.write_session(
+                    session_id=s.session_id,
+                    data=(params.data or ""),
+                    newline=bool(params.newline),
+                    eof=bool(params.eof),
+                )
+            )
 
         if params.action == "kill":
-            if not s.exited:
-                s.process.kill()
-                await s.process.wait()
-                s.exited = True
-                s.exit_code = s.process.returncode
-            return {"status": "completed", "session_id": s.session_id, "exit_code": s.exit_code}
+            return await self._engine.run_async(self._engine.kill_session(session_id=s.session_id))
 
         if params.action == "remove":
             self._registry.remove(s.session_id)
@@ -778,7 +952,73 @@ class ProcessTool(BaseTool):
         return {"status": "failed", "reason": "unknown action"}
 
     def _run(self, action: str, **kwargs: Any) -> Any:
-        return asyncio.run(self._arun(action, **kwargs))
+        params = ProcessInput(action=action, **kwargs)
+
+        if params.action == "list":
+            items = []
+            now = time.time()
+            for s in self._registry.list():
+                items.append(
+                    {
+                        "session_id": s.session_id,
+                        "status": "running" if not s.exited else ("completed" if s.exit_code == 0 else "failed"),
+                        "pid": s.process.pid,
+                        "runtime_ms": int((now - s.started_at) * 1000),
+                        "cwd": s.cwd,
+                        "command": s.command,
+                        "tail": s.tail,
+                        "backgrounded": s.backgrounded,
+                    }
+                )
+            return {"status": "completed", "sessions": items}
+
+        if params.action == "clear":
+            self._registry.clear()
+            return {"status": "completed"}
+
+        if not params.session_id:
+            return {"status": "failed", "reason": "session_id required"}
+
+        s = self._registry.get(params.session_id)
+        if not s:
+            return {"status": "failed", "reason": "session not found"}
+
+        if params.action == "poll":
+            return {
+                "status": "completed" if s.exited else "running",
+                "session_id": s.session_id,
+                "exit_code": s.exit_code if s.exited else None,
+                "tail": s.tail,
+            }
+
+        if params.action == "log":
+            text = s.aggregated or ""
+            offset = int(params.offset or 0)
+            limit = int(params.limit or 4000)
+            sliced = text[offset : offset + limit]
+            return {"status": "completed", "session_id": s.session_id, "text": sliced}
+
+        if params.action == "write":
+            timeout_s = _int_env("AGENT_EXEC_TOOL_CALL_TIMEOUT_S", 20, min_v=5, max_v=120)
+            return self._engine.run(
+                self._engine.write_session(
+                    session_id=s.session_id,
+                    data=(params.data or ""),
+                    newline=bool(params.newline),
+                    eof=bool(params.eof),
+                ),
+                timeout_s=float(timeout_s),
+            )
+
+        if params.action == "kill":
+            timeout_s = _int_env("AGENT_EXEC_TOOL_CALL_TIMEOUT_S", 20, min_v=5, max_v=120)
+            return self._engine.run(self._engine.kill_session(session_id=s.session_id), timeout_s=float(timeout_s))
+
+        if params.action == "remove":
+            self._registry.remove(s.session_id)
+            return {"status": "completed", "session_id": s.session_id}
+
+        return {"status": "failed", "reason": "unknown action"}
 
 
 def build_langchain_exec_tools(
@@ -788,11 +1028,13 @@ def build_langchain_exec_tools(
     forbid_path_override: bool = True,
 ) -> List[BaseTool]:
     registry = SessionRegistry()
+    engine = ExecEngine(registry)
     exec_tool = ExecTool(
+        engine,
         registry,
         allowlist=allowlist or [],
         safe_bins=safe_bins or [],
         forbid_path_override=forbid_path_override,
     )
-    process_tool = ProcessTool(registry)
+    process_tool = ProcessTool(engine, registry)
     return [exec_tool, process_tool]

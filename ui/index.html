@@ -302,6 +302,14 @@
             msg = { type: "assistant_delta", delta: String(ev.data || "") };
           }
 
+          if (msg.type === "push") {
+            const body = String(msg.assistant || msg.text || msg.message || "");
+            if (body.trim()) {
+              appendMessage("assistant", body);
+            }
+            return;
+          }
+
           if (msg.type === "assistant_delta") {
             if (!currentAssistantEl) {
               currentAssistantEl = appendMessage("assistant", "");
@@ -358,7 +366,15 @@
         sendBtn.disabled = true;
         currentAssistantEl = null;
         appendMessage("user", text);
-        ws.send(JSON.stringify({ text }));
+        let userId = "";
+        try {
+          userId = String(localStorage.getItem("agent_user_id") || "");
+          if (!userId.trim()) {
+            userId = String(Math.random()).slice(2) + String(Date.now());
+            localStorage.setItem("agent_user_id", userId);
+          }
+        } catch {}
+        ws.send(JSON.stringify({ text, user_id: userId || "default" }));
       }
 
       sendBtn.addEventListener("click", () => {

@@ -7,6 +7,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from memory.manager import MemoryManager
 
@@ -81,6 +82,7 @@ class SystemManager:
         model_name: str,
         observer_agent: object,
         memory_manager: MemoryManager,
+        notify_user: Callable[[dict[str, object]], None] | None = None,
     ) -> None:
         self._ctx = SystemContext(
             project_root=project_root.resolve(),
@@ -89,6 +91,7 @@ class SystemManager:
             model_name=model_name,
             observer_agent=observer_agent,
             memory_manager=memory_manager,
+            notify_user=notify_user,
         )
         self._reminders_dir = (self._ctx.project_root / "schedules").resolve()
         self._reminders_path = (self._reminders_dir / "reminders.json").resolve()
@@ -109,7 +112,15 @@ class SystemManager:
     def trigger(self, task_id: str) -> bool:
         return self._scheduler.trigger(task_id)
 
-    def reminder_create_at(self, *, run_ts: float, message: str, reminder_id: str = "") -> str:
+    def reminder_create_at(
+        self,
+        *,
+        run_ts: float,
+        message: str,
+        reminder_id: str = "",
+        user_id: str = "default",
+        thread_id: str = "default",
+    ) -> str:
         msg = (message or "").strip()
         if not msg:
             raise ValueError("message is required")
@@ -121,6 +132,8 @@ class SystemManager:
             "created_at": _ts_to_iso(float(now_ts)),
             "status": "scheduled",
             "message": msg,
+            "user_id": (user_id or "").strip() or "default",
+            "thread_id": (thread_id or "").strip() or "default",
         }
         with self._reminders_lock:
             state = self._reminders_load()
@@ -138,22 +151,39 @@ class SystemManager:
             schedule=OneShotSchedule(run_ts=float(run_ts)),
             message=msg,
             on_complete=lambda final_text, rid=rid: self._reminder_mark_done(rid, final_text),
+            user_id=(user_id or "").strip() or "default",
+            thread_id=(thread_id or "").strip() or "default",
         )
         self._scheduler.register_task(task)
         if float(run_ts) <= now_ts:
             self._scheduler.trigger(rid, when_ts=now_ts + 0.1)
         return rid
 
-    def reminder_create_in(self, *, delay_s: float, message: str, reminder_id: str = "") -> str:
+    def reminder_create_in(
+        self,
+        *,
+        delay_s: float,
+        message: str,
+        reminder_id: str = "",
+        user_id: str = "default",
+        thread_id: str = "default",
+    ) -> str:
         s = float(delay_s)
         if s <= 0:
             raise ValueError("delay_s must be > 0")
-        return self.reminder_create_at(run_ts=time.time() + s, message=message, reminder_id=reminder_id)
+        return self.reminder_create_at(
+            run_ts=time.time() + s,
+            message=message,
+            reminder_id=reminder_id,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
 
-    def reminder_cancel(self, reminder_id: str) -> bool:
+    def reminder_cancel(self, reminder_id: str, *, user_id: str = "") -> bool:
         rid = (reminder_id or "").strip()
         if not rid:
             return False
+        uid = (user_id or "").strip()
         changed = False
         with self._reminders_lock:
             state = self._reminders_load()
@@ -162,7 +192,12 @@ class SystemManager:
                 for it in items:
                     if not isinstance(it, dict):
                         continue
-                    if (it.get("id") or "") == rid and (it.get("status") or "") == "scheduled":
+                    if (it.get("id") or "") != rid:
+                        continue
+                    if (it.get("status") or "") != "scheduled":
+                        continue
+                    if uid and ((it.get("user_id") or "") != uid):
+                        continue
                         it["status"] = "canceled"
                         it["canceled_at"] = _ts_to_iso(time.time())
                         changed = True
@@ -229,6 +264,8 @@ class SystemManager:
                         id=spec.id,
                         schedule=build_schedule(spec),
                         prompt=prompt,
+                        user_id=(os.environ.get("AGENT_USER_ID") or "").strip() or "default",
+                        thread_id=(os.environ.get("AGENT_THREAD_ID") or "").strip() or "default",
                     )
                 )
             if kind == "memory_rollup":
@@ -256,6 +293,8 @@ class SystemManager:
             rid = it.get("id")
             msg = it.get("message")
             run_ts = it.get("run_ts")
+            uid = it.get("user_id")
+            tid = it.get("thread_id")
             if not isinstance(rid, str) or not rid.strip():
                 continue
             if not isinstance(msg, str) or not msg.strip():
@@ -271,6 +310,8 @@ class SystemManager:
                     schedule=OneShotSchedule(run_ts=t),
                     message=msg.strip(),
                     on_complete=lambda final_text, rid=rid.strip(): self._reminder_mark_done(rid, final_text),
+                    user_id=uid.strip() if isinstance(uid, str) and uid.strip() else "default",
+                    thread_id=tid.strip() if isinstance(tid, str) and tid.strip() else "default",
                 )
             )
         return tasks
@@ -299,6 +340,12 @@ class SystemManager:
             "status": (status or "").strip() if isinstance(status, str) else str(status or "").strip(),
             "message": msg.strip() if isinstance(msg, str) else "",
         }
+        uid = it.get("user_id")
+        if isinstance(uid, str) and uid.strip():
+            out["user_id"] = uid.strip()
+        tid = it.get("thread_id")
+        if isinstance(tid, str) and tid.strip():
+            out["thread_id"] = tid.strip()
 
         canceled = it.get("canceled_at")
         if not isinstance(canceled, str) or not canceled.strip():

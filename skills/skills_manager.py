@@ -321,6 +321,37 @@ class SkillManager:
         skills_state.record_installed(n, source="local:create")
         return f"Created: {skill_md.as_posix()}"
 
+    def _resolve_installed_from_spec(self, spec: str) -> tuple[str, str] | None:
+        s = (spec or "").strip()
+        if not s:
+            return None
+        safe = _safe_skill_name(s)
+        candidates = {s, safe}
+        manifests = discover_skills_from_dirs(self.skills_dirs)
+        for m in manifests:
+            if m.name in candidates or m.skill_md_path.parent.name in candidates:
+                return m.name, m.skill_md_path.parent.resolve().as_posix()
+        state = skills_state.load_state()
+        installed = state.get("installed")
+        if isinstance(installed, dict):
+            key = f"npx:{s}"
+            for name, meta in installed.items():
+                if not isinstance(name, str) or not isinstance(meta, dict):
+                    continue
+                source = meta.get("source")
+                if isinstance(source, str) and source.strip() == key:
+                    for m in manifests:
+                        if m.name == name:
+                            return m.name, m.skill_md_path.parent.resolve().as_posix()
+        for d in (self.project_skills_dir / s, self.project_skills_dir / safe):
+            try:
+                r = d.resolve()
+            except Exception:
+                continue
+            if (r / "SKILL.md").exists():
+                return r.name, r.as_posix()
+        return None
+
     def _run(
         self,
         command: str,
@@ -580,6 +611,14 @@ class SkillManager:
         spec = (package_spec or "").strip()
         if not spec:
             return "Empty package_spec."
+        resolved = self._resolve_installed_from_spec(spec)
+        if resolved is not None:
+            name, path = resolved
+            return json.dumps(
+                {"ok": True, "already_installed": True, "spec": spec, "name": name, "path": path, "exit_code": 0, "added": []},
+                ensure_ascii=False,
+                sort_keys=True,
+            )
         if not (shutil.which("npx") or "").strip():
             return json.dumps(
                 {
@@ -819,9 +858,10 @@ class SkillManager:
         x = (name_or_package_spec or "").strip()
         if not x:
             return "Empty name_or_package_spec."
-        installed = {m.name for m in discover_skills_from_dirs(self.skills_dirs)}
-        if x in installed:
-            return json.dumps({"already_installed": True, "name": x}, ensure_ascii=False, sort_keys=True)
+        resolved = self._resolve_installed_from_spec(x)
+        if resolved is not None:
+            name, path = resolved
+            return json.dumps({"already_installed": True, "name": name, "path": path}, ensure_ascii=False, sort_keys=True)
         return self.install_via_npx(x)
 
     def prune_disabled_from_project(self) -> str:

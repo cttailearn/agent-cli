@@ -10,6 +10,7 @@
     "AGENT_MEMORY_DIR": "memory",
     "AGENT_OUTPUT_DIR": "out",
     "AGENT_PROJECT_DIR": "workspace",
+    "AGENT_RECURSION_LIMIT": "128",
     "AGENT_SESSION_MEMORY_INPUT_TOKENS_THRESHOLD": "200000",
     "AGENT_SKILLS_DIR": ".skills",
     "_comment": [

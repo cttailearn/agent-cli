@@ -34,6 +34,127 @@ def _auth_ttl_s_default() -> int:
     return max(60, min(86400, v))
 
 
+_IDENTITY_MEMORY_BLOCK_START = "<IDENTITY_AUTH>"
+_IDENTITY_MEMORY_BLOCK_END = "</IDENTITY_AUTH>"
+
+_ADMIN_PASSPHRASE_RX = re.compile(r"(?i)(?:身份鉴定口令|身份鉴别口令|主用户口令|超级管理员口令)[\s\*]*[:：=]\s*(\S+)")
+_ADMIN_NAME_RX = re.compile(r"(?i)(?:姓名/称呼|姓名|称呼)[\s\*]*[:：=]\s*(\S+)")
+
+
+def _default_project_root() -> Path:
+    project_dir_env = (os.environ.get("AGENT_PROJECT_DIR") or "").strip()
+    if project_dir_env:
+        return Path(project_dir_env).expanduser().resolve()
+    repo_root = Path(__file__).resolve().parent.parent
+    return (repo_root / "workspace").resolve()
+
+
+def _read_user_md(project_root: Path) -> str:
+    p = paths.user_path(project_root)
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        return p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _parse_identity_kv(body: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for raw_line in (body or "").splitlines():
+        line = (raw_line or "").strip()
+        if not line:
+            continue
+        k, sep, v = line.partition(":")
+        if not sep:
+            continue
+        key = (k or "").strip()
+        val = (v or "").strip()
+        if key:
+            out[key] = val
+    return out
+
+
+def _iter_identity_blocks(text: str) -> list[dict[str, str]]:
+    t = text or ""
+    out: list[dict[str, str]] = []
+    pos = 0
+    while True:
+        start = t.find(_IDENTITY_MEMORY_BLOCK_START, pos)
+        if start < 0:
+            break
+        end = t.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
+        if end < 0:
+            break
+        body = t[start + len(_IDENTITY_MEMORY_BLOCK_START) : end]
+        data = _parse_identity_kv(body)
+        if data:
+            out.append(data)
+        pos = end + len(_IDENTITY_MEMORY_BLOCK_END)
+    return out
+
+
+def _extract_admin_credential(user_md: str) -> tuple[str, str] | None:
+    text = user_md or ""
+    m = _ADMIN_PASSPHRASE_RX.search(text)
+    if not m:
+        return None
+    passphrase = (m.group(1) or "").strip()
+    if not passphrase:
+        return None
+    name = ""
+    m2 = _ADMIN_NAME_RX.search(text)
+    if m2:
+        name = (m2.group(1) or "").strip()
+    username = name or "主人"
+    return username, passphrase
+
+
+def _load_credential_map(project_root: Path) -> dict[str, str]:
+    user_md = _read_user_md(project_root)
+    out: dict[str, str] = {}
+    for d in _iter_identity_blocks(user_md):
+        u = (d.get("username") or "").strip()
+        pw = d.get("password") or ""
+        if u and pw:
+            out[u] = pw
+    admin = _extract_admin_credential(user_md)
+    if admin is not None:
+        u, pw = admin
+        if u and pw and u not in out:
+            out[u] = pw
+    return out
+
+
+def _sanitize_core_text_for_model(core_text: str) -> str:
+    text = core_text or ""
+    while True:
+        start = text.find(_IDENTITY_MEMORY_BLOCK_START)
+        if start < 0:
+            break
+        end = text.find(_IDENTITY_MEMORY_BLOCK_END, start + len(_IDENTITY_MEMORY_BLOCK_START))
+        if end < 0:
+            text = text[:start].rstrip()
+            break
+        text = (text[:start] + text[end + len(_IDENTITY_MEMORY_BLOCK_END) :]).strip()
+
+    out_lines: list[str] = []
+    for line in (text or "").splitlines():
+        s = (line or "").strip()
+        if not s:
+            out_lines.append(line)
+            continue
+        low = s.lower()
+        if "password" in low and (":" in s or "：" in s or "=" in s):
+            continue
+        if "口令" in s or "passphrase" in low or "auth_token" in low or "auth_pass" in low:
+            continue
+        if "身份确认" in s or "identity_confirmed" in low:
+            continue
+        out_lines.append(line)
+    return "\n".join(out_lines).strip()
+
+
 def set_thread_auth(
     thread_id: str,
     *,
@@ -85,7 +206,6 @@ def get_thread_auth(thread_id: str, *, purge_expired: bool = True) -> dict[str, 
     out: dict[str, object] = {
         "auth_valid": bool(ok),
         "user": (raw.get("user") or ""),
-        "password": (raw.get("password") or ""),
         "ttl_s": int(raw.get("ttl_s") or 0),
     }
     if exp_ts:
@@ -109,6 +229,7 @@ def verify_thread_auth(
     password: str,
     ttl_s: int | None = None,
     extend: bool = True,
+    project_root: Path | None = None,
 ) -> tuple[bool, dict[str, object]]:
     tid = (thread_id or "").strip() or "default"
     u = (user or "").strip()
@@ -136,7 +257,21 @@ def verify_thread_auth(
                     _THREAD_AUTH[tid] = dict(cur)
             return True, get_thread_auth(tid, purge_expired=False)
 
+    root = (project_root or _default_project_root()).resolve()
+    cred_map = _load_credential_map(root)
+    expected = cred_map.get(u)
+    bootstrap = (os.environ.get("AGENT_USER_BOOTSTRAP") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+    if expected is None:
+        if not bootstrap and cred_map:
+            return False, {"auth_valid": False}
+    else:
+        if expected != pw:
+            return False, {"auth_valid": False}
+
     data = set_thread_auth(tid, user=u, password=pw, ttl_s=ttl_s)
+    if expected is None and not cred_map:
+        data = dict(data)
+        data["bootstrap"] = True
     return True, data
 
 
@@ -310,6 +445,45 @@ _AUTH_INLINE_RX = re.compile(
     r"(?i)(?:专属口令|口令|passphrase|auth_pass|auth_token)\s*(?:[:：=])\s*(\S+)(?:\s*(?:=>|->|→)\s*(.+))?$"
 )
 
+_TURN_NOISE_LINE_RX = re.compile(
+    r"(?is)^\s*(?:"
+    r"你好+|您好+|嗨|哈喽|在吗|"
+    r"谢谢|多谢|谢啦|thanks|thx|"
+    r"不客气|没事|"
+    r"好的|ok|okay|收到|明白|了解|"
+    r"辛苦了|麻烦了|拜托了|"
+    r"继续|"
+    r"嗯+|恩+|哦+|啊+|哈+|"
+    r")\s*[!！。.,，;；:：]*\s*$"
+)
+
+
+def _strip_turn_noise(text: str) -> str:
+    s = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not s:
+        return ""
+    lines = s.split("\n")
+    kept: list[str] = []
+    for ln in lines:
+        if not ln.strip():
+            continue
+        if _TURN_NOISE_LINE_RX.match(ln):
+            continue
+        kept.append(ln.rstrip())
+    return "\n".join(kept).strip()
+
+
+def _is_trivial_turn(user_text: str, assistant_text: str) -> bool:
+    u = _strip_turn_noise(user_text)
+    a = _strip_turn_noise(assistant_text)
+    if not u and not a:
+        return True
+    if len(u) <= 6 and not re.search(r"[A-Za-z0-9_/\\.\-]+", u):
+        if len(a) <= 6 and not re.search(r"[A-Za-z0-9_/\\.\-]+", a):
+            return True
+    return False
+
+
 
 def _extract_last_user_text(request: ModelRequest) -> str:
     msgs = getattr(request, "messages", None)
@@ -322,6 +496,54 @@ def _extract_last_user_text(request: ModelRequest) -> str:
             if isinstance(role, str) and role.strip().lower() == "user":
                 return (_extract_text(m) or "").strip()
     return ""
+
+
+def _should_inject_recent_timeline(user_text: str) -> bool:
+    s = (user_text or "").strip()
+    if not s:
+        return False
+    s2 = s.replace(" ", "")
+    if s2 in {"继续", "接着", "继续吧", "接着说", "继续说"}:
+        return True
+    if any(x in s2 for x in ["继续", "接着", "刚才", "刚刚", "上面", "前面", "上一条", "上一次"]):
+        return len(s2) <= 18
+    return False
+
+
+def _read_recent_timeline_markdown(project_root: Path, *, d: date, max_lines: int, max_chars: int) -> str:
+    try:
+        p = (paths.episodic_dir(project_root) / f"{d.isoformat()}.md").resolve()
+    except Exception:
+        return ""
+    if not p.exists() or not p.is_file():
+        return ""
+    try:
+        text = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    lines = (text or "").splitlines()
+    start = None
+    for i, ln in enumerate(lines):
+        if (ln or "").strip() == "## 时间线（Timeline）":
+            start = i + 1
+            break
+    if start is None:
+        return ""
+    body: list[str] = []
+    for ln in lines[start:]:
+        if (ln or "").startswith("## "):
+            break
+        if (ln or "").strip():
+            body.append(ln.rstrip())
+    if not body:
+        return ""
+    tail = body[-max_lines:] if max_lines > 0 else body
+    out = "\n".join(tail).strip()
+    if not out:
+        return ""
+    if max_chars > 0 and len(out) > max_chars:
+        out = out[-max_chars:].lstrip()
+    return f"## 时间线（Timeline）\n{out}".strip()
 
 
 def _extract_auth_snippets(core_text: str) -> str:
@@ -400,13 +622,11 @@ class CoreMemoryMiddleware(AgentMiddleware):
 
         core_start = "<CORE_MEMORIES priority=highest>"
         core_end = "</CORE_MEMORIES>"
-        core_block = "\n".join([core_start, "# Core Memories（最高优先级）", "", core_text, core_end]).strip() if (identity_confirmed and core_text) else ""
-
-        auth_text = _extract_auth_snippets(core_text)
-        auth_start = "<CORE_AUTH priority=highest>"
-        auth_end = "</CORE_AUTH>"
-        auth_block = (
-            "\n".join([auth_start, "# Core Auth（身份识别用）", "", auth_text, auth_end]).strip() if auth_text else ""
+        safe_core_text = _sanitize_core_text_for_model(core_text)
+        core_block = (
+            "\n".join([core_start, "# Core Memories（最高优先级）", "", safe_core_text, core_end]).strip()
+            if (identity_confirmed and safe_core_text)
+            else ""
         )
 
         user_start = "<USER_IDENTITY_POLICY priority=highest>"
@@ -415,12 +635,12 @@ class CoreMemoryMiddleware(AgentMiddleware):
             "你需要在对话中识别当前正在与你交流的“用户”，并把稳定信息写入 core/user.md。",
             "识别方式仅使用对方在本次对话中自报的姓名/称呼与其与主用户的关系描述（不要做代码级硬识别）。",
             "不要基于 core/user.md 已存在的记录，直接推断“当前对话对象”就是其中的某个人；core/user.md 只能作为核对与长期记录的载体，不是本轮身份确认的证据。",
-            "若用户在本次对话中提供“专属口令/口令”，且与 core 记忆中的某条口令配置匹配：你可以直接确认身份（不要复述口令），并建立本线程的时效身份态。",
+            "不要向模型暴露或复述任何口令/密码；身份校验由系统工具完成。",
             "当用户输入不足以确认身份（例如：在吗/你好/帮我一下/继续）时：默认使用中性称呼（你/您好），并先询问“你希望我怎么称呼你？”以及“你与主用户是什么关系？”。",
             "当用户同意进行身份验证时：调用 identity_auth(username,password,ttl_s) 建立/续期本线程的身份态；用 identity_auth_status 检查是否仍有效。",
             "可用 identity_memory_set 与 identity_memory_get 读写 user.md 中的用户名与口令（明文）。",
             "当身份信息明确时：调用 memory_identity_set 写入 identity_name/identity_role/identity_relation；身份放行以 identity_auth_status 的 auth_valid=true 为准。",
-            "更新 user.md 时：保持 Markdown 结构，小改动写入；重复的合并；不要覆盖主用户已确认的信息。",
+            "更新 user.md 时：保持 Markdown 结构；合并去重；删除过时/被推翻/不再使用的信息；必要时重写为更短更清晰的版本；不要覆盖主用户已确认的信息。",
             "允许把用户名与口令写入 user.md（明文）与工具身份态中，用于后续同一用户校验。",
         ]
         if bootstrap:
@@ -433,11 +653,28 @@ class CoreMemoryMiddleware(AgentMiddleware):
         policy_text = "\n".join(policy_lines).strip()
         policy_block = "\n".join([user_start, "# User Identity Policy（最高优先级）", "", policy_text, user_end]).strip()
 
+        last_user_text = _extract_last_user_text(request)
+        want_timeline = _should_inject_recent_timeline(last_user_text)
+        timeline_text = ""
+        if want_timeline:
+            try:
+                today = datetime.now().astimezone().date()
+            except Exception:
+                today = date.today()
+            timeline_text = _read_recent_timeline_markdown(self.project_root, d=today, max_lines=50, max_chars=2400)
+        session_start = "<SESSION_TIMELINE priority=high>"
+        session_end = "</SESSION_TIMELINE>"
+        session_block = (
+            "\n".join([session_start, "# 最近会话记忆（时间线）", "", timeline_text, session_end]).strip()
+            if timeline_text
+            else ""
+        )
+
         rest = _strip_block(base_text, start=time_start, end=time_end)
         rest = _strip_block(rest, start=core_start, end=core_end)
-        rest = _strip_block(rest, start=auth_start, end=auth_end)
         rest = _strip_block(rest, start=user_start, end=user_end)
-        blocks = [b for b in [time_block, auth_block, core_block, policy_block, rest.strip()] if b and b.strip()]
+        rest = _strip_block(rest, start=session_start, end=session_end)
+        blocks = [b for b in [time_block, core_block, policy_block, session_block, rest.strip()] if b and b.strip()]
         new_text = "\n\n".join(blocks).strip()
         if new_text == base_text:
             return handler(request)
@@ -873,7 +1110,7 @@ class MemoryManager:
                 "## 关键词",
                 "格式要求：",
                 "- 每个小节用无序列表（- ...）。",
-                "- 场景小节每条尽量用：- [scene=<场景>] 做了什么：...；发生了什么：...；完成了什么：...；关键词：k1/k2；kind=<fact|constraint|decision|preference|plan|result>",
+                "- 场景小节每条尽量用：- [scene=<场景>] 做：...；发生：...；完成：...；关键词：k1/k2；kind=<fact|constraint|decision|preference|plan|result>",
                 "- 关键词小节每条只放一个关键词（不要整句）。",
             ]
         ).strip()
@@ -998,7 +1235,7 @@ class MemoryManager:
             "## 关键词\n"
             "格式要求：\n"
             "- 每个小节用无序列表（- ...）。\n"
-            "- 主要场景每条尽量用：- [scene=<场景>] 本周做了什么：...；本周进展：...；本周完成：...；关键词：k1/k2\n"
+            "- 主要场景每条尽量用：- [scene=<场景>] 本周做：...；本周进展：...；本周完成：...；关键词：k1/k2\n"
             "- 关键词小节每条只放一个关键词。\n"
         )
         out = self._summarize_markdown(system_text=sys, human_text=inp)
@@ -1062,6 +1299,7 @@ class MemoryManager:
             "## 关键词\n"
             "格式要求：\n"
             "- 每个小节用无序列表（- ...）。\n"
+            "- 主要场景每条尽量用：- [scene=<场景>] 本月做：...；本月进展：...；本月完成：...；关键词：k1/k2\n"
             "- 关键词小节每条只放一个关键词。\n"
         )
         out = self._summarize_markdown(system_text=sys, human_text=inp)
@@ -1111,6 +1349,7 @@ class MemoryManager:
             "## 关键词\n"
             "格式要求：\n"
             "- 每个小节用无序列表（- ...）。\n"
+            "- 主要场景每条尽量用：- [scene=<场景>] 本年做：...；本年进展：...；本年完成：...；关键词：k1/k2\n"
             "- 关键词小节每条只放一个关键词。\n"
         )
         out = self._summarize_markdown(system_text=sys, human_text=inp)
@@ -1171,6 +1410,8 @@ class MemoryManager:
                     continue
                 if not isinstance(user_text, str) or not isinstance(assistant_text, str):
                     continue
+                if _is_trivial_turn(user_text, assistant_text):
+                    continue
                 usage = token_usage if isinstance(token_usage, dict) else None
                 threshold = self._session_input_tokens_threshold()
                 input_tokens = int((usage or {}).get("input_tokens") or 0)
@@ -1179,7 +1420,10 @@ class MemoryManager:
                     if self._write_raw_sessions_enabled()
                     else None
                 )
-                items = self._extract_session_items(user_text=user_text, assistant_text=assistant_text)
+                items = self._extract_session_items(
+                    user_text=_strip_turn_noise(user_text),
+                    assistant_text=_strip_turn_noise(assistant_text),
+                )
                 epi_p = self._append_episodic_md(dt=dt, items=items)
                 if threshold > 0 and input_tokens > threshold:
                     self._rotate_thread_with_carryover(user_text=user_text, assistant_text=assistant_text, dt=dt)
@@ -1221,10 +1465,12 @@ class MemoryManager:
                 "- scene：4~24 个字，场景标题，尽量具体（围绕任务/问题/决策/进展/协作），去重，不要包含日期时间。\n"
                 "- do/happen/done：各 0~1 句，尽量精确，避免泛化。\n"
                 "- keywords：0~8 个词，保留可检索的精确信息（数字/版本号/端口/路径/文件名/函数名/命令/参数/URL/错误码/配置键/阈值/ID 等）；不要把这些信息泛化成“若干/一些/大概”。\n"
+                "- 忽略寒暄/客套/感谢/确认收到/情绪宣泄等无实质信息；不要把它们写入 items。\n"
+                "- 不要记录日期/相对时间/具体时刻（如 今天/昨天/刚才/上午/周一/2026-01-01/15:30），除非它是硬性约束或明确的计划/截止。\n"
                 "- 若出现对比或变更：写清“从什么变成什么”。\n"
                 "- 不要编造对话中不存在的具体值；若对话未给出具体数字/路径/报错信息，则不要补全。\n"
                 "- kind：可选，取值之一：fact|constraint|decision|preference|plan|result。\n"
-                "- items 数量 3~12，信息不足时可少于 3。\n"
+                "- items 只保留对未来有用的关键信息（最多 6 条；信息不足时可少于 1 条）。\n"
             )
         )
         human = HumanMessage(content=f"用户：\n{(user_text or '').strip()}\n\n助手：\n{(assistant_text or '').strip()}\n")
@@ -1259,6 +1505,8 @@ class MemoryManager:
                 continue
             k = k.strip()
             if not k:
+                continue
+            if re.search(r"(寒暄|闲聊|打招呼|问候|致谢)", k):
                 continue
             lk = k.lower()
             if lk in seen:
@@ -1409,7 +1657,6 @@ class MemoryManager:
             return None
         p = self._episodic_md_path(dt=dt)
         time_str = dt.strftime("%H:%M")
-        bucket = self._time_bucket_tag(dt)
 
         def _split_sections(text: str) -> tuple[list[str], list[tuple[str, list[str]]]]:
             lines = (text or "").splitlines()
@@ -1473,6 +1720,16 @@ class MemoryManager:
                     return i
             return None
 
+        def _normalize_timeline_bullet(line: str) -> str:
+            s = (line or "").strip()
+            if not s:
+                return ""
+            if s.startswith("-"):
+                s = s[1:].strip()
+            s = re.sub(r"^\(\d{2}:\d{2}\)\s*", "", s)
+            s = re.sub(r"\s+", " ", s).strip()
+            return s
+
         def _build_structured_text(it: dict[str, str]) -> str:
             do = (it.get("do") or "").strip()
             happen = (it.get("happen") or "").strip()
@@ -1480,11 +1737,11 @@ class MemoryManager:
             keywords = (it.get("keywords") or "").strip()
             parts: list[str] = []
             if do:
-                parts.append(f"做了什么：{do}")
+                parts.append(f"做：{do}")
             if happen:
-                parts.append(f"发生了什么：{happen}")
+                parts.append(f"发生：{happen}")
             if done:
-                parts.append(f"完成了什么：{done}")
+                parts.append(f"完成：{done}")
             if not parts:
                 content = (it.get("content") or "").strip()
                 if content:
@@ -1498,17 +1755,22 @@ class MemoryManager:
             preamble, sections = _split_sections(existing)
             if not existing.strip():
                 preamble = [f"# 会话记忆（提取） {dt.date().isoformat()}"]
-                sections = []
             else:
                 if not any((ln or "").strip() for ln in preamble):
                     preamble = [f"# 会话记忆（提取） {dt.date().isoformat()}"]
 
             timeline_key = "时间线（Timeline）"
             timeline_idx = _find_section_index(sections, timeline_key)
-            if timeline_idx is None:
-                sections.insert(0, (timeline_key, []))
-                timeline_idx = 0
+            tl_lines: list[str] = []
+            if timeline_idx is not None:
+                _, body = sections[timeline_idx]
+                tl_lines = list(body or [])
+            sections = [(timeline_key, tl_lines)]
+            timeline_idx = 0
 
+            tl_key, tl_body = sections[timeline_idx]
+            tl_lines = list(tl_body or [])
+            tl_existing = {_normalize_timeline_bullet(x) for x in tl_lines if isinstance(x, str)}
             for it in items:
                 k = (it.get("keyword") or "").strip()
                 kind = (it.get("kind") or "").strip()
@@ -1516,25 +1778,14 @@ class MemoryManager:
                 if not k or not body_text:
                     continue
                 prefix = f"[{kind}] " if kind else ""
-                bullet = f"- ({time_str}) [{bucket}] {prefix}{body_text}".rstrip()
-
-                idx = _find_section_index(sections, k)
-                if idx is None:
-                    sections.append((k, [bullet]))
-                else:
-                    sec_key, body = sections[idx]
-                    body_lines = list(body or [])
-                    if bullet not in body_lines:
-                        body_lines.append(bullet)
-                        sections[idx] = (sec_key, body_lines)
-
-                tl_bullet = f"- ({time_str}) [{bucket}] [scene={k}] {prefix}{body_text}".rstrip()
-                tl_key, tl_body = sections[timeline_idx]
-                tl_lines = list(tl_body or [])
-                if tl_bullet not in tl_lines:
+                summary = f"{prefix}{body_text}".strip()
+                tl_bullet = f"- ({time_str}) [scene={k}] {summary}".rstrip()
+                tl_norm = _normalize_timeline_bullet(tl_bullet)
+                if tl_norm not in tl_existing:
+                    tl_existing.add(tl_norm)
                     tl_lines.append(tl_bullet)
-                    sections[timeline_idx] = (tl_key, tl_lines)
 
+            sections[timeline_idx] = (tl_key, tl_lines)
             new_text = _render(preamble, sections)
             if not new_text.strip():
                 return None
